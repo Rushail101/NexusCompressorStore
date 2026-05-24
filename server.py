@@ -437,16 +437,21 @@ def _serve_chunk(req_peer,file_id,chunk_index):
 
 # ── React build serving ───────────────────────────────────────────────────────
 
+# ── Fallback Route (Redirects or confirms API status) ─────────────────────────
+
 @app.route("/", defaults={"path":""})
 @app.route("/<path:path>")
 def serve_react(path):
-    dist=os.path.join(os.path.dirname(__file__),"dist")
-    if not os.path.exists(dist):
-        return jsonify({"error":"React build not found. Run: npm run build"}), 404
-    full=os.path.join(dist,path)
-    if path and os.path.exists(full):
-        return send_from_directory(dist,path)
-    return send_from_directory(dist,"index.html")
+    # If a request drops into the API root, confirm it's online
+    if not path or path == "/":
+        return jsonify({
+            "status": "online",
+            "message": "Nexus API Gateway is running smoothly.",
+            "version": "Phase 8"
+        }), 200
+        
+    # Standard 404 fall-through for any missing API routes
+    return jsonify({"error": f"Route /{path} not found on this gateway"}), 404
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 

@@ -54,10 +54,14 @@ sock = Sock(app)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SUPABASE_URL         = os.environ.get("SUPABASE_URL",         "https://hoqzrxxqczxwwnqimvxm.supabase.co")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhvcXpyeHhxY3p4d3ducWltdnhtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzI3MDMzOCwiZXhwIjoyMDgyODQ2MzM4fQ.v_YOgXRbcK6FwzOgcfbaOxt7R8J6mqlaT7puet-qpvo")
-SUPABASE_JWT_SECRET  = os.environ.get("SUPABASE_JWT_SECRET",  "SIBvO35YB+bRG2O7skHYiPxEO3cjOEocDDsOePVQXfZWytAffOB25Yv3ljaPruFgceQFkZpmiNXLryawcciizA==")
+# ── Config ────────────────────────────────────────────────────────────────────
 
+SUPABASE_URL         = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+SUPABASE_JWT_SECRET  = os.environ.get("SUPABASE_JWT_SECRET")
+
+# Keep everything else below this line the same...
+BLOB_BUCKET  = "nexus-blobs"
 BLOB_BUCKET  = "nexus-blobs"
 CHUNK_BUCKET = "nexus-chunks"
 CHUNK_SIZE   = 256 * 1024

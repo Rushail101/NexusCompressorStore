@@ -1,19 +1,16 @@
 """
-Nexus – Phase 7: Supabase DB + Storage + ML compression model
-=============================================================
-What's new vs Phase 6:
-  • Metadata stored in Supabase DB (files, chunks, user_stats tables)
-    instead of local meta.json — source of truth is now the DB
-  • Duplicate filename detection: upload returns 409 if user already
-    has an active (non-trashed) file with the same filename
-  • Duplicate hash detection (dedup): still works as before
-  • Phase 7 ML: a lightweight GradientBoosting model trained per category
-    on historical compression samples. Falls back to heuristic if < 5 samples.
-  • Supabase Storage still used for blobs and chunks (Phase 6)
-  • local meta.json is gone — all reads/writes go through Supabase DB
+Nexus – Phase 8
+===============
+New features on top of Phase 7:
+  • Folders  — create/rename/delete/list with breadcrumb navigation
+  • Sharing  — share a file by email, view-only access via share token
+  • Quota    — 10 GB hard cap per user enforced server-side
+  • Admin    — /admin/* routes gated to admins table; returns network
+               health, all-user stats, storage usage
+  • Mobile   — no server changes needed; existing API already works
+               for React Native. /health returns capabilities list.
 
-Install:
-    pip install supabase PyJWT zstandard cryptography scikit-learn numpy flask flask-sock flask-cors
+All Phase 7 features (ML model, Supabase DB+Storage, P2P WS) unchanged.
 """
 
 from flask import Flask, request, jsonify, send_file, g
@@ -60,327 +57,52 @@ sock = Sock(app)
 SUPABASE_URL         = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 SUPABASE_JWT_SECRET  = os.environ.get("SUPABASE_JWT_SECRET")
+ADMIN_EMAIL          = os.environ.get("ADMIN_EMAIL",          "rushailharjai10@gmail.com")
 
-# Keep everything else below this line the same...
-BLOB_BUCKET  = "nexus-blobs"
 BLOB_BUCKET  = "nexus-blobs"
 CHUNK_BUCKET = "nexus-chunks"
 CHUNK_SIZE   = 256 * 1024
 TRASH_DAYS   = 7
-
+QUOTA_BYTES  = 10 * 1024 * 1024 * 1024   # 10 GB default
 SECRET_FILE  = "./master.secret"
 NONCE_SIZE   = 12
 ML_MODEL_DIR = "./ml_models"
 os.makedirs(ML_MODEL_DIR, exist_ok=True)
 
-# ── Supabase client ───────────────────────────────────────────────────────────
-
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 print(f"[nexus] Supabase connected → {SUPABASE_URL}")
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ── Encryption ────────────────────────────────────────────────────
 
-def db_get_file(uid: str, file_hash: str) -> dict | None:
-    """Fetch a single file row by uid + hash."""
-    res = (sb.table("files")
-             .select("*")
-             .eq("user_id", uid)
-             .eq("hash", file_hash)
-             .limit(1)
-             .execute())
-    return res.data[0] if res.data else None
+def _load_master_secret():
+    if os.path.exists(SECRET_FILE):
+        with open(SECRET_FILE, "rb") as f: return f.read()
+    s = secrets.token_bytes(32)
+    with open(SECRET_FILE, "wb") as f: f.write(s)
+    return s
 
+MASTER_SECRET = _load_master_secret()
 
-def db_get_file_by_name(uid: str, filename: str) -> dict | None:
-    """
-    Fetch an active (non-trashed) file row by uid + filename.
-    Used for duplicate filename detection.
-    """
-    res = (sb.table("files")
-             .select("id, filename, hash")
-             .eq("user_id", uid)
-             .eq("filename", filename)
-             .is_("deleted_at", "null")
-             .limit(1)
-             .execute())
-    return res.data[0] if res.data else None
+def derive_key(fh: str) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32,
+                salt=bytes.fromhex(fh), info=b"nexus-file-enc").derive(MASTER_SECRET)
 
+def encrypt(data: bytes, fh: str) -> bytes:
+    nonce = secrets.token_bytes(NONCE_SIZE)
+    return nonce + AESGCM(derive_key(fh)).encrypt(nonce, data, None)
 
-def db_list_files(uid: str, view: str = "active") -> list:
-    """List files for a user filtered by view."""
-    q = sb.table("files").select("*").eq("user_id", uid)
-    if view == "active":
-        q = q.is_("deleted_at", "null")
-    elif view == "starred":
-        q = q.eq("starred", True).is_("deleted_at", "null")
-    elif view == "trash":
-        q = q.not_.is_("deleted_at", "null")
-    res = q.order("upload_time", desc=True).execute()
-    return res.data or []
+def decrypt(blob: bytes, fh: str) -> bytes:
+    return AESGCM(derive_key(fh)).decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:], None)
 
-
-def db_upsert_file(uid: str, entry: dict):
-    """
-    Insert or update a file row.
-    Uses check-then-insert/update to avoid ON CONFLICT constraint dependency.
-    """
-    row = {
-        "user_id":           uid,
-        "hash":              entry["hash"],
-        "filename":          entry["filename"],
-        "category":          entry["category"],
-        "original_size":     entry["original_size"],
-        "stored_size":       entry["stored_size"],
-        "ratio":             float(entry["ratio"]),
-        "zstd_level":        entry["level"],
-        "chunk_count":       entry["chunk_count"],
-        "ref_count":         entry.get("ref_count", 1),
-        "dedup_bytes_saved": entry.get("dedup_bytes_saved", 0),
-        "encrypted":         True,
-        "starred":           entry.get("starred", False),
-        "deleted_at":        entry.get("deleted_at"),
-        "upload_time":       entry.get("upload_time_iso"),
-    }
-
-    # Safely add optional columns that may not exist in older DB schemas
-    optional_cols = {"ml_model_version": entry.get("ml_model_version")}
-    for col, val in optional_cols.items():
-        if val is not None:
-            row[col] = val
-
-    # Check if row already exists
-    existing = db_get_file(uid, entry["hash"])
-    if existing:
-        # Update existing row by its primary key
-        update_data = {k: v for k, v in row.items() if k not in ("user_id",)}
-        try:
-            sb.table("files").update(update_data).eq("user_id", uid).eq("hash", entry["hash"]).execute()
-        except Exception as e:
-            # Strip any columns that caused errors and retry
-            for bad_col in ["ml_model_version"]:
-                if bad_col in str(e):
-                    update_data.pop(bad_col, None)
-            sb.table("files").update(update_data).eq("user_id", uid).eq("hash", entry["hash"]).execute()
-    else:
-        # Insert new row
-        try:
-            sb.table("files").insert(row).execute()
-        except Exception as e:
-            for bad_col in ["ml_model_version"]:
-                if bad_col in str(e):
-                    row.pop(bad_col, None)
-            sb.table("files").insert(row).execute()
-
-
-def db_upsert_chunks(uid: str, file_hash: str, chunks: list):
-    """Upsert chunk metadata rows."""
-    # Get file id first
-    file_row = db_get_file(uid, file_hash)
-    if not file_row:
-        return
-    file_id = file_row["id"]
-    rows = [{
-        "file_id":     file_id,
-        "chunk_index": c["index"],
-        "chunk_hash":  c["id"],
-        "size":        c["size"],
-        "storage_path": f"{uid}/{file_hash}/{c['index']}.chunk",
-    } for c in chunks]
-    if rows:
-        sb.table("chunks").upsert(rows, on_conflict="file_id,chunk_index").execute()
-
-
-def db_update_stats(uid: str, original_size: int, stored_size: int,
-                    is_dedup: bool = False, dedup_saved: int = 0, delete: bool = False):
-    """Upsert user_stats row — increments totals."""
-    # Fetch current stats
-    res = sb.table("user_stats").select("*").eq("user_id", uid).limit(1).execute()
-    cur = res.data[0] if res.data else {
-        "user_id": uid, "total_files": 0, "total_original": 0,
-        "total_stored": 0, "total_dedup_events": 0, "total_dedup_saved": 0,
-    }
-    if delete:
-        cur["total_files"]    = max(0, cur.get("total_files", 0) - 1)
-        cur["total_original"] = max(0, cur.get("total_original", 0) - original_size)
-        cur["total_stored"]   = max(0, cur.get("total_stored", 0) - stored_size)
-    elif is_dedup:
-        cur["total_dedup_events"] = cur.get("total_dedup_events", 0) + 1
-        cur["total_dedup_saved"]  = cur.get("total_dedup_saved", 0) + dedup_saved
-    else:
-        cur["total_files"]    = cur.get("total_files", 0) + 1
-        cur["total_original"] = cur.get("total_original", 0) + original_size
-        cur["total_stored"]   = cur.get("total_stored", 0) + stored_size
-    cur["updated_at"] = "now()"
-    sb.table("user_stats").upsert(cur, on_conflict="user_id").execute()
-
-
-# ── Phase 7: ML compression optimizer ────────────────────────────────────────
-# One GradientBoostingRegressor per file category.
-# Features: [file_size_log, zstd_level, entropy_estimate]
-# Target:   compression ratio (original / compressed)
-#
-# On upload we try all candidate levels, pick the best-known from the model,
-# then record the actual result to retrain incrementally.
-#
-# Serialised to disk in ml_models/<category>.pkl so training persists
-# across server restarts.
-
-CATEGORIES = ["image","video","audio","document","archive","code","other"]
-
-# In-memory training buffer: { category: [(features, ratio), ...] }
-_ml_lock    = threading.Lock()
-_ml_models  = {}    # category → fitted GBR or None
-_ml_samples = {c: [] for c in CATEGORIES}  # category → [(X, y)]
-_ml_version = {c: 0  for c in CATEGORIES}  # increment on retrain
-
-MIN_SAMPLES_TO_FIT = 5   # need this many before we use the model
-_CANDIDATE_LEVELS  = list(range(1, 23))  # zstd 1..22
-
-def _model_path(category: str) -> str:
-    return os.path.join(ML_MODEL_DIR, f"{category}.pkl")
-
-def _load_models():
-    """Load any previously saved models from disk on startup."""
-    for cat in CATEGORIES:
-        p = _model_path(cat)
-        if os.path.exists(p):
-            try:
-                with open(p, "rb") as f:
-                    _ml_models[cat] = pickle.load(f)
-                print(f"[ml] loaded model for {cat}")
-            except Exception as e:
-                print(f"[ml] could not load {cat}: {e}")
-
-def _save_model(category: str):
-    p = _model_path(category)
-    with open(p, "wb") as f:
-        pickle.dump(_ml_models.get(category), f)
-
-def _entropy_estimate(data: bytes) -> float:
-    """
-    Fast byte-level entropy estimate (0–8 bits).
-    High entropy → already compressed/encrypted → poor zstd ratio.
-    """
-    if not data:
-        return 0.0
-    sample = data[:4096]  # first 4 KB is enough
-    counts = np.bincount(np.frombuffer(sample, dtype=np.uint8), minlength=256).astype(float)
-    probs  = counts / counts.sum()
-    probs  = probs[probs > 0]
-    return float(-np.sum(probs * np.log2(probs)))
-
-def _features(file_size: int, level: int, entropy: float) -> np.ndarray:
-    return np.array([[
-        np.log1p(file_size),   # log scale handles 1 KB → 10 GB
-        level / 22.0,          # normalise to [0,1]
-        entropy / 8.0,         # normalise to [0,1]
-    ]])
-
-def _predict_ratio(category: str, file_size: int, level: int, entropy: float) -> float:
-    """Predict compression ratio for given features. Returns heuristic if no model."""
-    with _ml_lock:
-        model = _ml_models.get(category)
-    if model is None:
-        # Heuristic fallback
-        base = {"image":1.05,"video":1.02,"audio":1.03,
-                "document":3.5,"archive":1.01,"code":6.0,"other":1.5}.get(category, 2.0)
-        return base * (1 + (level / 22.0) * 0.3)
-    try:
-        return float(model.predict(_features(file_size, level, entropy))[0])
-    except Exception:
-        return 1.0
-
-def _record_sample(category: str, file_size: int, level: int, entropy: float, ratio: float):
-    """Add a training sample and retrain if we have enough data."""
-    with _ml_lock:
-        _ml_samples[category].append((_features(file_size, level, entropy)[0], ratio))
-        samples = _ml_samples[category]
-
-        if len(samples) >= MIN_SAMPLES_TO_FIT and len(samples) % 3 == 0:
-            # Retrain every 3 new samples (cheap for small datasets)
-            X = np.array([s[0] for s in samples])
-            y = np.array([s[1] for s in samples])
-            model = GradientBoostingRegressor(
-                n_estimators=50, max_depth=3, learning_rate=0.1,
-                random_state=42
-            )
-            model.fit(X, y)
-            _ml_models[category] = model
-            _ml_version[category] += 1
-            _save_model(category)
-            print(f"[ml] retrained {category} v{_ml_version[category]} on {len(samples)} samples")
-
-def get_best_level_ml(category: str, file_size: int, entropy: float) -> int:
-    """
-    Use the ML model to predict the best zstd level.
-    Samples a subset of candidate levels and picks the one
-    predicted to give the highest ratio.
-    """
-    candidates = [1, 3, 6, 9, 12, 15, 19, 22]  # 8 probes instead of 22
-    best_level, best_pred = 5, 0.0
-    for lvl in candidates:
-        pred = _predict_ratio(category, file_size, lvl, entropy)
-        if pred > best_pred:
-            best_pred  = pred
-            best_level = lvl
-    return best_level
-
-# Load models from disk at startup
-_load_models()
-
-# ── Storage helpers ───────────────────────────────────────────────────────────
-
-def storage_upload(bucket: str, path: str, data: bytes):
-    sb.storage.from_(bucket).upload(
-        path, data,
-        file_options={"content-type": "application/octet-stream", "upsert": "true"}
-    )
-
-def storage_download(bucket: str, path: str) -> bytes:
-    return sb.storage.from_(bucket).download(path)
-
-def storage_delete(bucket: str, paths: list):
-    if paths:
-        sb.storage.from_(bucket).remove(paths)
-
-def blob_path(uid: str, fh: str) -> str:
-    return f"{uid}/{fh}.zst.enc"
-
-def chunk_path(uid: str, fh: str, idx: int) -> str:
-    return f"{uid}/{fh}/{idx}.chunk"
-
-def split_and_upload_chunks(data: bytes, file_hash: str, uid: str) -> list:
-    chunks = []
-    for i in range(0, len(data), CHUNK_SIZE):
-        chunk = data[i:i+CHUNK_SIZE]
-        idx   = i // CHUNK_SIZE
-        storage_upload(CHUNK_BUCKET, chunk_path(uid, file_hash, idx), chunk)
-        chunks.append({"id": hashlib.sha256(chunk).hexdigest()[:16], "index": idx, "size": len(chunk)})
-    return chunks
-
-def fetch_chunk_bytes(uid: str, file_hash: str, idx: int) -> bytes:
-    return storage_download(CHUNK_BUCKET, chunk_path(uid, file_hash, idx))
-
-def delete_from_storage(uid: str, file_hash: str, chunk_count: int):
-    storage_delete(BLOB_BUCKET, [blob_path(uid, file_hash)])
-    paths = [chunk_path(uid, file_hash, i) for i in range(chunk_count)]
-    if paths:
-        storage_delete(CHUNK_BUCKET, paths)
-
-# ── JWT auth ──────────────────────────────────────────────────────────────────
+# ── JWT + auth ────────────────────────────────────────────────────
 
 def verify_token(token: str) -> dict | None:
     try:
-        return pyjwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
+        return pyjwt.decode(token, SUPABASE_JWT_SECRET,
+                            algorithms=["HS256"], options={"verify_aud": False})
     except pyjwt.ExpiredSignatureError:
         return None
     except Exception:
-        # Fallback: decode without signature (local dev only)
         try:
             return pyjwt.decode(token, options={"verify_signature": False}, algorithms=["HS256"])
         except Exception:
@@ -400,57 +122,257 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── Encryption ────────────────────────────────────────────────────────────────
+def require_admin(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        payload = verify_token(auth[7:])
+        if not payload:
+            return jsonify({"error": "Unauthorized"}), 401
+        g.uid   = payload.get("sub")
+        g.email = payload.get("email", "")
+        # Check admins table
+        res = sb.table("admins").select("user_id").eq("user_id", g.uid).limit(1).execute()
+        if not res.data:
+            return jsonify({"error": "Forbidden — admin only"}), 403
+        return f(*args, **kwargs)
+    return decorated
 
-def load_master_secret():
-    if os.path.exists(SECRET_FILE):
-        with open(SECRET_FILE, "rb") as f:
-            return f.read()
-    s = secrets.token_bytes(32)
-    with open(SECRET_FILE, "wb") as f:
-        f.write(s)
-    return s
+# ── DB helpers ────────────────────────────────────────────────────
 
-MASTER_SECRET = load_master_secret()
+def db_get_file(uid: str, file_hash: str) -> dict | None:
+    res = sb.table("files").select("*").eq("user_id", uid).eq("hash", file_hash).limit(1).execute()
+    return res.data[0] if res.data else None
 
-def derive_key(fh: str) -> bytes:
-    return HKDF(algorithm=hashes.SHA256(), length=32,
-                salt=bytes.fromhex(fh), info=b"nexus-file-enc").derive(MASTER_SECRET)
+def db_get_file_by_name(uid: str, filename: str, folder_id: str | None = None) -> dict | None:
+    q = sb.table("files").select("id,filename,hash").eq("user_id", uid).eq("filename", filename).is_("deleted_at", "null")
+    if folder_id:
+        q = q.eq("folder_id", folder_id)
+    else:
+        q = q.is_("folder_id", "null")
+    res = q.limit(1).execute()
+    return res.data[0] if res.data else None
 
-def encrypt(data: bytes, fh: str) -> bytes:
-    nonce = secrets.token_bytes(NONCE_SIZE)
-    return nonce + AESGCM(derive_key(fh)).encrypt(nonce, data, None)
+def db_list_files(uid: str, view: str = "active", folder_id: str | None = None) -> list:
+    q = sb.table("files").select("*").eq("user_id", uid)
+    if view == "active":
+        q = q.is_("deleted_at", "null")
+        if folder_id:
+            q = q.eq("folder_id", folder_id)
+        else:
+            q = q.is_("folder_id", "null")
+    elif view == "starred":
+        q = q.eq("starred", True).is_("deleted_at", "null")
+    elif view == "trash":
+        q = q.not_.is_("deleted_at", "null")
+    res = q.order("upload_time", desc=True).execute()
+    return res.data or []
 
-def decrypt(blob: bytes, fh: str) -> bytes:
-    return AESGCM(derive_key(fh)).decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:], None)
+def db_upsert_file(uid: str, entry: dict):
+    row = {
+        "user_id":           uid,
+        "hash":              entry["hash"],
+        "filename":          entry["filename"],
+        "category":          entry["category"],
+        "original_size":     entry["original_size"],
+        "stored_size":       entry["stored_size"],
+        "ratio":             float(entry["ratio"]),
+        "zstd_level":        entry["level"],
+        "chunk_count":       entry["chunk_count"],
+        "ref_count":         entry.get("ref_count", 1),
+        "dedup_bytes_saved": entry.get("dedup_bytes_saved", 0),
+        "encrypted":         True,
+        "starred":           entry.get("starred", False),
+        "deleted_at":        entry.get("deleted_at"),
+        "upload_time":       entry.get("upload_time_iso"),
+        "folder_id":         entry.get("folder_id"),
+    }
+    for col in ["ml_model_version"]:
+        if entry.get(col) is not None:
+            row[col] = entry[col]
 
-# ── File category ─────────────────────────────────────────────────────────────
+    existing = db_get_file(uid, entry["hash"])
+    try:
+        if existing:
+            upd = {k: v for k, v in row.items() if k != "user_id"}
+            sb.table("files").update(upd).eq("user_id", uid).eq("hash", entry["hash"]).execute()
+        else:
+            sb.table("files").insert(row).execute()
+    except Exception as e:
+        for bad in ["ml_model_version"]:
+            if bad in str(e):
+                row.pop(bad, None)
+        if existing:
+            upd = {k: v for k, v in row.items() if k != "user_id"}
+            sb.table("files").update(upd).eq("user_id", uid).eq("hash", entry["hash"]).execute()
+        else:
+            sb.table("files").insert(row).execute()
 
-def file_category(filename: str) -> str:
+def db_upsert_chunks(uid: str, file_hash: str, chunks: list):
+    file_row = db_get_file(uid, file_hash)
+    if not file_row: return
+    rows = [{
+        "file_id":      file_row["id"],
+        "chunk_index":  c["index"],
+        "chunk_hash":   c["id"],
+        "size":         c["size"],
+        "storage_path": f"{uid}/{file_hash}/{c['index']}.chunk",
+    } for c in chunks]
+    if rows:
+        sb.table("chunks").upsert(rows, on_conflict="file_id,chunk_index").execute()
+
+def db_get_user_stats(uid: str) -> dict:
+    res = sb.table("user_stats").select("*").eq("user_id", uid).limit(1).execute()
+    return res.data[0] if res.data else {
+        "user_id": uid, "total_files": 0, "total_original": 0,
+        "total_stored": 0, "total_dedup_events": 0, "total_dedup_saved": 0,
+        "quota_bytes": QUOTA_BYTES,
+    }
+
+def db_update_stats(uid: str, original_size: int, stored_size: int,
+                    is_dedup: bool = False, dedup_saved: int = 0, delete: bool = False):
+    cur = db_get_user_stats(uid)
+    if delete:
+        cur["total_files"]    = max(0, cur.get("total_files", 0) - 1)
+        cur["total_original"] = max(0, cur.get("total_original", 0) - original_size)
+        cur["total_stored"]   = max(0, cur.get("total_stored", 0) - stored_size)
+    elif is_dedup:
+        cur["total_dedup_events"] = cur.get("total_dedup_events", 0) + 1
+        cur["total_dedup_saved"]  = cur.get("total_dedup_saved", 0) + dedup_saved
+    else:
+        cur["total_files"]    = cur.get("total_files", 0) + 1
+        cur["total_original"] = cur.get("total_original", 0) + original_size
+        cur["total_stored"]   = cur.get("total_stored", 0) + stored_size
+    cur.setdefault("quota_bytes", QUOTA_BYTES)
+    cur["updated_at"] = datetime.now(timezone.utc).isoformat()
+    sb.table("user_stats").upsert(cur, on_conflict="user_id").execute()
+
+# ── Quota helpers ─────────────────────────────────────────────────
+
+def get_quota(uid: str) -> tuple[int, int]:
+    """Returns (used_bytes, quota_bytes)."""
+    stats = db_get_user_stats(uid)
+    return stats.get("total_stored", 0), stats.get("quota_bytes", QUOTA_BYTES)
+
+def check_quota(uid: str, incoming_bytes: int) -> bool:
+    """Returns True if the upload fits within the user's quota."""
+    used, quota = get_quota(uid)
+    return (used + incoming_bytes) <= quota
+
+# ── Phase 7 ML (unchanged) ────────────────────────────────────────
+
+CATEGORIES = ["image","video","audio","document","archive","code","other"]
+_ml_lock    = threading.Lock()
+_ml_models  = {}
+_ml_samples = {c: [] for c in CATEGORIES}
+_ml_version = {c: 0  for c in CATEGORIES}
+MIN_SAMPLES = 5
+
+def _model_path(c): return os.path.join(ML_MODEL_DIR, f"{c}.pkl")
+
+def _load_models():
+    for cat in CATEGORIES:
+        p = _model_path(cat)
+        if os.path.exists(p):
+            try:
+                with open(p, "rb") as f: _ml_models[cat] = pickle.load(f)
+            except Exception: pass
+
+def _save_model(c):
+    with open(_model_path(c), "wb") as f: pickle.dump(_ml_models.get(c), f)
+
+def _entropy(data: bytes) -> float:
+    if not data: return 0.0
+    s = data[:4096]
+    counts = np.bincount(np.frombuffer(s, dtype=np.uint8), minlength=256).astype(float)
+    p = counts / counts.sum(); p = p[p > 0]
+    return float(-np.sum(p * np.log2(p)))
+
+def _feat(sz, lvl, ent): return np.array([[np.log1p(sz), lvl/22.0, ent/8.0]])
+
+def _predict(cat, sz, lvl, ent):
+    with _ml_lock: model = _ml_models.get(cat)
+    if model is None:
+        base = {"image":1.05,"video":1.02,"audio":1.03,"document":3.5,
+                "archive":1.01,"code":6.0,"other":1.5}.get(cat, 2.0)
+        return base * (1 + (lvl/22.0)*0.3)
+    try: return float(model.predict(_feat(sz,lvl,ent))[0])
+    except Exception: return 1.0
+
+def _record(cat, sz, lvl, ent, ratio):
+    with _ml_lock:
+        _ml_samples[cat].append((_feat(sz,lvl,ent)[0], ratio))
+        samp = _ml_samples[cat]
+        if len(samp) >= MIN_SAMPLES and len(samp) % 3 == 0:
+            X = np.array([s[0] for s in samp]); y = np.array([s[1] for s in samp])
+            m = GradientBoostingRegressor(n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42)
+            m.fit(X, y); _ml_models[cat] = m; _ml_version[cat] += 1; _save_model(cat)
+
+def best_level_ml(cat, sz, ent):
+    cands = [1,3,6,9,12,15,19,22]
+    bl, bp = 5, 0.0
+    for lvl in cands:
+        p = _predict(cat, sz, lvl, ent)
+        if p > bp: bp, bl = p, lvl
+    return bl
+
+_load_models()
+
+# ── Storage helpers ───────────────────────────────────────────────
+
+def storage_upload(bucket, path, data):
+    sb.storage.from_(bucket).upload(path, data,
+        file_options={"content-type":"application/octet-stream","upsert":"true"})
+
+def storage_download(bucket, path):
+    return sb.storage.from_(bucket).download(path)
+
+def storage_delete(bucket, paths):
+    if paths: sb.storage.from_(bucket).remove(paths)
+
+def blob_path(uid, fh):    return f"{uid}/{fh}.zst.enc"
+def chunk_path(uid, fh, i): return f"{uid}/{fh}/{i}.chunk"
+
+def split_upload_chunks(data, fh, uid):
+    chunks = []
+    for i in range(0, len(data), CHUNK_SIZE):
+        chunk = data[i:i+CHUNK_SIZE]; idx = i//CHUNK_SIZE
+        storage_upload(CHUNK_BUCKET, chunk_path(uid,fh,idx), chunk)
+        chunks.append({"id":hashlib.sha256(chunk).hexdigest()[:16],"index":idx,"size":len(chunk)})
+    return chunks
+
+def fetch_chunk_bytes(uid, fh, idx):
+    return storage_download(CHUNK_BUCKET, chunk_path(uid,fh,idx))
+
+def delete_from_storage(uid, fh, chunk_count):
+    storage_delete(BLOB_BUCKET, [blob_path(uid,fh)])
+    paths = [chunk_path(uid,fh,i) for i in range(chunk_count)]
+    if paths: storage_delete(CHUNK_BUCKET, paths)
+
+# ── File category ─────────────────────────────────────────────────
+
+def file_category(filename):
     ext = os.path.splitext(filename)[1].lower()
-    if ext in [".jpg",".jpeg",".png",".gif",".webp",".bmp"]:           return "image"
-    if ext in [".mp4",".mkv",".avi",".mov",".webm"]:                   return "video"
-    if ext in [".mp3",".wav",".flac",".aac",".ogg"]:                   return "audio"
-    if ext in [".pdf",".doc",".docx",".txt",".md"]:                    return "document"
-    if ext in [".zip",".gz",".tar",".rar",".7z"]:                      return "archive"
-    if ext in [".py",".js",".ts",".jsx",".json",".html",".css",
-               ".cpp",".c",".java"]:                                   return "code"
+    if ext in [".jpg",".jpeg",".png",".gif",".webp",".bmp"]: return "image"
+    if ext in [".mp4",".mkv",".avi",".mov",".webm"]:         return "video"
+    if ext in [".mp3",".wav",".flac",".aac",".ogg"]:         return "audio"
+    if ext in [".pdf",".doc",".docx",".txt",".md"]:          return "document"
+    if ext in [".zip",".gz",".tar",".rar",".7z"]:            return "archive"
+    if ext in [".py",".js",".ts",".jsx",".json",".html",".css",".cpp",".c",".java"]: return "code"
     return "other"
 
-# ── Peer registry ─────────────────────────────────────────────────────────────
+# ── Peer registry ─────────────────────────────────────────────────
 
 PEER_COLORS = ["#EF4444","#F59E0B","#10B981","#3B82F6","#8B5CF6","#EC4899",
                "#06B6D4","#F97316","#84CC16","#A78BFA","#34D399","#FB923C"]
-peers      = {}
-peers_lock = threading.Lock()
-color_idx  = 0
+peers = {}; peers_lock = threading.Lock(); color_idx = 0
 
 def next_color():
-    global color_idx
-    c = PEER_COLORS[color_idx % len(PEER_COLORS)]; color_idx += 1; return c
+    global color_idx; c = PEER_COLORS[color_idx % len(PEER_COLORS)]; color_idx += 1; return c
 
-def new_peer_id():
-    return "P-" + secrets.token_hex(4).upper()
+def new_peer_id(): return "P-" + secrets.token_hex(4).upper()
 
 def peer_summary():
     with peers_lock:
@@ -463,34 +385,30 @@ def broadcast(msg, exclude=None):
     with peers_lock:
         dead = []
         for pid,p in peers.items():
-            if pid == exclude: continue
+            if pid==exclude: continue
             try: p["ws"].send(data)
             except: dead.append(pid)
-        for pid in dead: peers.pop(pid, None)
+        for pid in dead: peers.pop(pid,None)
 
-def send_to(peer_id, msg):
+def send_to(pid, msg):
     with peers_lock:
-        p = peers.get(peer_id)
+        p = peers.get(pid)
         if p:
             try: p["ws"].send(json.dumps(msg)); return True
-            except: peers.pop(peer_id, None)
+            except: peers.pop(pid,None)
     return False
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+# ── WebSocket ─────────────────────────────────────────────────────
 
 @sock.route("/ws")
 def websocket(ws):
     token   = request.args.get("token","")
     payload = verify_token(token) if token else None
     uid     = payload.get("sub") if payload else "anonymous"
-    peer_id = new_peer_id(); color = next_color()
-
-    with peers_lock:
-        peers[peer_id] = {"ws":ws,"color":color,"joined":time.time(),"chunks":{},"uid":uid}
-
-    ws.send(json.dumps({"type":"welcome","peer_id":peer_id,"color":color}))
+    pid     = new_peer_id(); color = next_color()
+    with peers_lock: peers[pid] = {"ws":ws,"color":color,"joined":time.time(),"chunks":{},"uid":uid}
+    ws.send(json.dumps({"type":"welcome","peer_id":pid,"color":color}))
     broadcast({"type":"peers_updated","peers":peer_summary()})
-
     try:
         while True:
             raw = ws.receive()
@@ -498,19 +416,15 @@ def websocket(ws):
             try: msg = json.loads(raw)
             except: continue
             t = msg.get("type")
-            if t == "have":
+            if t=="have":
                 with peers_lock:
-                    if peer_id in peers:
-                        peers[peer_id]["chunks"][msg.get("file_id")] = msg.get("chunks",[])
+                    if pid in peers: peers[pid]["chunks"][msg.get("file_id")] = msg.get("chunks",[])
                 broadcast({"type":"peers_updated","peers":peer_summary()})
-            elif t == "want":
-                _serve_chunk(peer_id, msg.get("file_id"), msg.get("chunk_index"))
-            elif t == "ping":
-                ws.send(json.dumps({"type":"pong"}))
-    except Exception as e:
-        print(f"[ws] {peer_id}: {e}")
+            elif t=="want": _serve_chunk(pid, msg.get("file_id"), msg.get("chunk_index"))
+            elif t=="ping": ws.send(json.dumps({"type":"pong"}))
+    except Exception as e: print(f"[ws] {pid}: {e}")
     finally:
-        with peers_lock: peers.pop(peer_id, None)
+        with peers_lock: peers.pop(pid,None)
         broadcast({"type":"peers_updated","peers":peer_summary()})
 
 def _serve_chunk(req_peer, file_id, chunk_index):
@@ -521,328 +435,483 @@ def _serve_chunk(req_peer, file_id, chunk_index):
                 source=pid; break
     if source:
         send_to(source,{"type":"chunk_request","file_id":file_id,
-                        "chunk_index":chunk_index,"for_peer":req_peer})
-        return
-    # Fallback: Supabase Storage
+                        "chunk_index":chunk_index,"for_peer":req_peer}); return
     uid = None
     with peers_lock:
         p = peers.get(req_peer)
         if p: uid = p.get("uid")
     if not uid or uid=="anonymous":
-        send_to(req_peer,{"type":"chunk_error","file_id":file_id,
-                          "chunk_index":chunk_index,"message":"auth required"})
-        return
+        send_to(req_peer,{"type":"chunk_error","file_id":file_id,"chunk_index":chunk_index,"message":"auth required"}); return
     try:
         b64 = base64.b64encode(fetch_chunk_bytes(uid,file_id,chunk_index)).decode()
         send_to(req_peer,{"type":"chunk_data","file_id":file_id,"chunk_index":chunk_index,
                           "data":b64,"from_peer":"STORAGE","from_color":"#3B82F6"})
     except Exception as e:
-        print(f"[storage] chunk fetch failed: {e}")
-        send_to(req_peer,{"type":"chunk_error","file_id":file_id,
-                          "chunk_index":chunk_index,"message":"not found"})
+        send_to(req_peer,{"type":"chunk_error","file_id":file_id,"chunk_index":chunk_index,"message":"not found"})
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# ── HTTP Routes ──────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","peers":len(peers),"supabase":sb is not None})
+    return jsonify({
+        "status": "ok", "peers": len(peers), "supabase": True,
+        "capabilities": ["folders","sharing","quota","admin","p2p","ml","encryption"],
+    })
 
+# ── Folders ───────────────────────────────────────────────────────
+
+@app.route("/folders", methods=["GET"])
+@require_auth
+def list_folders():
+    """List folders at a given level. ?parent_id=<uuid> or root if omitted."""
+    parent_id = request.args.get("parent_id")
+    q = sb.table("folders").select("*").eq("user_id", g.uid)
+    if parent_id:
+        q = q.eq("parent_id", parent_id)
+    else:
+        q = q.is_("parent_id", "null")
+    res = q.order("name").execute()
+    return jsonify(res.data or [])
+
+@app.route("/folders", methods=["POST"])
+@require_auth
+def create_folder():
+    body      = request.get_json(silent=True) or {}
+    name      = (body.get("name") or "").strip()
+    parent_id = body.get("parent_id")
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    # Check for duplicate name in same parent
+    q = sb.table("folders").select("id").eq("user_id", g.uid).eq("name", name)
+    if parent_id:
+        q = q.eq("parent_id", parent_id)
+    else:
+        q = q.is_("parent_id", "null")
+    if q.execute().data:
+        return jsonify({"error": f'A folder named "{name}" already exists here'}), 409
+    row = {"user_id": g.uid, "name": name, "parent_id": parent_id}
+    res = sb.table("folders").insert(row).execute()
+    return jsonify(res.data[0]), 201
+
+@app.route("/folders/<folder_id>", methods=["PATCH"])
+@require_auth
+def rename_folder(folder_id):
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name: return jsonify({"error": "name required"}), 400
+    sb.table("folders").update({"name": name}).eq("id", folder_id).eq("user_id", g.uid).execute()
+    return jsonify({"status": "renamed"})
+
+@app.route("/folders/<folder_id>", methods=["DELETE"])
+@require_auth
+def delete_folder(folder_id):
+    """
+    Delete a folder and move its files to root (rather than cascade-deleting files).
+    Sub-folders are moved to root too.
+    """
+    sb.table("files").update({"folder_id": None}).eq("folder_id", folder_id).eq("user_id", g.uid).execute()
+    sb.table("folders").update({"parent_id": None}).eq("parent_id", folder_id).eq("user_id", g.uid).execute()
+    sb.table("folders").delete().eq("id", folder_id).eq("user_id", g.uid).execute()
+    return jsonify({"status": "deleted"})
+
+@app.route("/files/<file_hash>/move", methods=["PATCH"])
+@require_auth
+def move_file(file_hash):
+    """Move a file to a different folder. folder_id=null moves to root."""
+    body      = request.get_json(silent=True) or {}
+    folder_id = body.get("folder_id")   # None = root
+    sb.table("files").update({"folder_id": folder_id}).eq("hash", file_hash).eq("user_id", g.uid).execute()
+    return jsonify({"status": "moved"})
+
+@app.route("/folders/<folder_id>/breadcrumb", methods=["GET"])
+@require_auth
+def folder_breadcrumb(folder_id):
+    """
+    Returns the chain from root → current folder as a list.
+    E.g. [{"id":"root","name":"My Files"}, {"id":"...", "name":"Projects"}, {"id":"...", "name":"2025"}]
+    """
+    crumbs = []
+    current_id = folder_id
+    seen = set()
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        res = sb.table("folders").select("id,name,parent_id").eq("id", current_id).eq("user_id", g.uid).limit(1).execute()
+        if not res.data: break
+        f = res.data[0]
+        crumbs.insert(0, {"id": f["id"], "name": f["name"]})
+        current_id = f.get("parent_id")
+    crumbs.insert(0, {"id": None, "name": "My Files"})
+    return jsonify(crumbs)
+
+# ── Sharing ───────────────────────────────────────────────────────
+
+@app.route("/share/<file_hash>", methods=["POST"])
+@require_auth
+def share_file(file_hash):
+    """Share a file with another user by email. View-only."""
+    body       = request.get_json(silent=True) or {}
+    recipient  = (body.get("email") or "").strip().lower()
+    expires_in = body.get("expires_days")   # optional int
+
+    if not recipient:
+        return jsonify({"error": "email required"}), 400
+    if recipient == g.email.lower():
+        return jsonify({"error": "Cannot share with yourself"}), 400
+
+    file_row = db_get_file(g.uid, file_hash)
+    if not file_row:
+        return jsonify({"error": "File not found"}), 404
+
+    # Check if already shared with this person
+    existing = sb.table("shared_files").select("id,share_token") \
+        .eq("file_id", file_row["id"]).eq("shared_with", recipient).limit(1).execute()
+    if existing.data:
+        return jsonify({"status": "already_shared", "share_token": existing.data[0]["share_token"]}), 200
+
+    token      = secrets.token_urlsafe(32)
+    expires_at = None
+    if expires_in:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=int(expires_in))).isoformat()
+
+    row = {
+        "file_id":     file_row["id"],
+        "owner_id":    g.uid,
+        "shared_with": recipient,
+        "share_token": token,
+        "expires_at":  expires_at,
+    }
+    sb.table("shared_files").insert(row).execute()
+    return jsonify({"status": "shared", "share_token": token, "shared_with": recipient}), 201
+
+@app.route("/share/<file_hash>", methods=["GET"])
+@require_auth
+def list_shares(file_hash):
+    """List everyone this file is shared with."""
+    file_row = db_get_file(g.uid, file_hash)
+    if not file_row: return jsonify({"error": "Not found"}), 404
+    res = sb.table("shared_files").select("shared_with,share_token,created_at,expires_at") \
+        .eq("file_id", file_row["id"]).eq("owner_id", g.uid).execute()
+    return jsonify(res.data or [])
+
+@app.route("/share/<file_hash>/revoke", methods=["DELETE"])
+@require_auth
+def revoke_share(file_hash):
+    """Remove sharing for a specific recipient."""
+    email = (request.args.get("email") or "").strip().lower()
+    if not email: return jsonify({"error": "email required"}), 400
+    file_row = db_get_file(g.uid, file_hash)
+    if not file_row: return jsonify({"error": "Not found"}), 404
+    sb.table("shared_files").delete() \
+        .eq("file_id", file_row["id"]).eq("owner_id", g.uid).eq("shared_with", email).execute()
+    return jsonify({"status": "revoked"})
+
+@app.route("/shared-with-me", methods=["GET"])
+@require_auth
+def shared_with_me():
+    """Files other users have shared with the current user."""
+    res = sb.table("shared_files").select(
+        "share_token, created_at, expires_at, files(hash, filename, category, original_size, stored_size, chunk_count, ratio)"
+    ).eq("shared_with", g.email.lower()).execute()
+    # Filter out expired shares
+    now  = datetime.now(timezone.utc)
+    out  = []
+    for row in (res.data or []):
+        if row.get("expires_at"):
+            try:
+                exp = datetime.fromisoformat(row["expires_at"].replace("Z","+00:00"))
+                if exp < now: continue
+            except Exception: pass
+        out.append(row)
+    return jsonify(out)
+
+@app.route("/shared/<token>/download", methods=["GET"])
+def download_shared(token):
+    """Download a shared file using only the share token — no auth needed."""
+    res = sb.table("shared_files").select(
+        "owner_id, expires_at, files(hash, filename, chunk_count)"
+    ).eq("share_token", token).limit(1).execute()
+    if not res.data:
+        return jsonify({"error": "Invalid or expired share link"}), 404
+    share   = res.data[0]
+    # Check expiry
+    if share.get("expires_at"):
+        try:
+            exp = datetime.fromisoformat(share["expires_at"].replace("Z","+00:00"))
+            if exp < datetime.now(timezone.utc):
+                return jsonify({"error": "Share link has expired"}), 410
+        except Exception: pass
+    file_info = share.get("files") or share.get("files(hash, filename, chunk_count)")
+    if not file_info: return jsonify({"error": "File not found"}), 404
+    uid       = share["owner_id"]
+    file_hash = file_info["hash"]
+    try:
+        blob     = storage_download(BLOB_BUCKET, blob_path(uid, file_hash))
+        original = zstd.ZstdDecompressor().decompress(decrypt(blob, file_hash))
+        return send_file(io.BytesIO(original), download_name=file_info["filename"], as_attachment=True)
+    except Exception as e:
+        return jsonify({"error": f"Download failed: {e}"}), 500
+
+# ── Quota ─────────────────────────────────────────────────────────
+
+@app.route("/quota", methods=["GET"])
+@require_auth
+def quota():
+    used, limit = get_quota(g.uid)
+    return jsonify({
+        "used_bytes":    used,
+        "quota_bytes":   limit,
+        "free_bytes":    max(0, limit - used),
+        "used_pct":      round(used / limit * 100, 2) if limit else 0,
+    })
+
+# ── Upload (with quota check) ─────────────────────────────────────
 
 @app.route("/upload", methods=["POST"])
 @require_auth
 def upload():
     file = request.files.get("file")
-    if not file:
-        return jsonify({"error":"No file"}), 400
+    if not file: return jsonify({"error": "No file"}), 400
 
     original_data = file.read()
     original_size = len(original_data)
     filename      = file.filename
     category      = file_category(filename)
     uid           = g.uid
+    folder_id     = request.form.get("folder_id")   # optional
 
-    # ── Duplicate filename check (before any processing) ──────────────────────
-    # Returns 409 if user already has an active file with this exact filename.
-    existing_name = db_get_file_by_name(uid, filename)
+    # ── Quota check ───────────────────────────────────────────────
+    if not check_quota(uid, original_size):
+        used, quota = get_quota(uid)
+        return jsonify({
+            "error":      "quota_exceeded",
+            "message":    f"Upload would exceed your {quota//(1024**3)} GB quota. "
+                          f"You have {(quota-used)//(1024**2)} MB remaining.",
+            "used_bytes":  used,
+            "quota_bytes": quota,
+        }), 413
+
+    # ── Duplicate filename check ──────────────────────────────────
+    existing_name = db_get_file_by_name(uid, filename, folder_id)
     if existing_name:
         return jsonify({
             "error":       "duplicate_filename",
-            "message":     f'You already have a file named "{filename}". Rename it or delete the existing one first.',
+            "message":     f'You already have a file named "{filename}" in this folder.',
             "existing_id": existing_name["hash"],
         }), 409
 
     file_hash = hashlib.sha256(original_data).hexdigest()
 
-    # ── Duplicate hash check (dedup) ──────────────────────────────────────────
+    # ── Dedup check ───────────────────────────────────────────────
     existing = db_get_file(uid, file_hash)
     if existing and not existing.get("deleted_at"):
-        # Same content — just increment ref_count
         new_ref   = (existing.get("ref_count") or 1) + 1
         new_dedup = (existing.get("dedup_bytes_saved") or 0) + existing["stored_size"]
-        sb.table("files").update({
-            "ref_count":         new_ref,
-            "dedup_bytes_saved": new_dedup,
-        }).eq("user_id", uid).eq("hash", file_hash).execute()
+        sb.table("files").update({"ref_count": new_ref, "dedup_bytes_saved": new_dedup}) \
+            .eq("user_id", uid).eq("hash", file_hash).execute()
         db_update_stats(uid, 0, 0, is_dedup=True, dedup_saved=existing["stored_size"])
-        return jsonify({
-            "status":            "deduplicated",
-            "file_id":           file_hash,
-            "hash":              file_hash,
-            "filename":          existing["filename"],
-            "original_size":     original_size,
-            "stored_size":       existing["stored_size"],
-            "ratio":             existing["ratio"],
-            "category":          category,
-            "chunk_count":       existing["chunk_count"],
-            "savings":           original_size - existing["stored_size"],
-            "ref_count":         new_ref,
-            "dedup_bytes_saved": new_dedup,
-            "encrypted":         True,
-        })
+        return jsonify({"status":"deduplicated","file_id":file_hash,"hash":file_hash,
+                        "filename":existing["filename"],"original_size":original_size,
+                        "stored_size":existing["stored_size"],"ratio":existing["ratio"],
+                        "category":category,"chunk_count":existing["chunk_count"],
+                        "savings":original_size-existing["stored_size"],
+                        "ref_count":new_ref,"dedup_bytes_saved":new_dedup,"encrypted":True})
 
-    # ── Phase 7: ML-guided compression level selection ────────────────────────
-    entropy      = _entropy_estimate(original_data)
-    best_level   = get_best_level_ml(category, original_size, entropy)
-    ml_version   = _ml_version.get(category, 0)
+    # ── ML compression ────────────────────────────────────────────
+    entropy    = _entropy(original_data)
+    best_level = best_level_ml(category, original_size, entropy)
+    ml_version = _ml_version.get(category, 0)
 
-    # Try the ML-recommended level plus its neighbours for safety
-    candidates = sorted(set([max(1,best_level-1), best_level, min(22,best_level+1)]))
     best_data, best_ratio, chosen_level = None, 0.0, best_level
-
-    for lvl in candidates:
+    for lvl in sorted(set([max(1,best_level-1), best_level, min(22,best_level+1)])):
         comp = zstd.ZstdCompressor(level=lvl).compress(original_data)
         r    = original_size / len(comp) if comp else 1
-        if r > best_ratio:
-            best_data, best_ratio, chosen_level = comp, r, lvl
+        if r > best_ratio: best_data, best_ratio, chosen_level = comp, r, lvl
+    _record(category, original_size, chosen_level, entropy, best_ratio)
 
-    # Record the actual result for the ML model to learn from
-    _record_sample(category, original_size, chosen_level, entropy, best_ratio)
-
-    # ── Encrypt + upload to Supabase Storage ──────────────────────────────────
+    # ── Encrypt + store ───────────────────────────────────────────
     encrypted_blob = encrypt(best_data, file_hash)
     stored_size    = len(encrypted_blob)
-
     storage_upload(BLOB_BUCKET, blob_path(uid, file_hash), encrypted_blob)
-    chunks      = split_and_upload_chunks(best_data, file_hash, uid)
+    chunks      = split_upload_chunks(best_data, file_hash, uid)
     chunk_count = len(chunks)
 
-    # ── Write to Supabase DB ──────────────────────────────────────────────────
-    from datetime import datetime, timezone
-    upload_time_iso = datetime.now(timezone.utc).isoformat()
-
     entry = {
-        "hash":              file_hash,
-        "filename":          filename,
-        "category":          category,
-        "original_size":     original_size,
-        "stored_size":       stored_size,
-        "ratio":             round(best_ratio, 3),
-        "level":             chosen_level,
-        "chunk_count":       chunk_count,
-        "upload_time_iso":   upload_time_iso,
-        "ref_count":         1,
-        "dedup_bytes_saved": 0,
-        "starred":           False,
-        "deleted_at":        None,
-        "ml_model_version":  ml_version,
+        "hash": file_hash, "filename": filename, "category": category,
+        "original_size": original_size, "stored_size": stored_size,
+        "ratio": round(best_ratio,3), "level": chosen_level,
+        "chunk_count": chunk_count, "upload_time_iso": datetime.now(timezone.utc).isoformat(),
+        "ref_count": 1, "dedup_bytes_saved": 0, "starred": False,
+        "deleted_at": None, "ml_model_version": ml_version, "folder_id": folder_id,
     }
     db_upsert_file(uid, entry)
-
-    # Fetch the inserted row to get its uuid (needed for chunks FK)
     db_upsert_chunks(uid, file_hash, chunks)
     db_update_stats(uid, original_size, stored_size)
+    broadcast({"type":"file_available","file_id":file_hash,"filename":filename,"chunk_count":chunk_count})
 
-    broadcast({"type":"file_available","file_id":file_hash,
-               "filename":filename,"chunk_count":chunk_count})
+    return jsonify({"status":"uploaded","file_id":file_hash,"hash":file_hash,
+                    "filename":filename,"category":category,"original_size":original_size,
+                    "stored_size":stored_size,"ratio":round(best_ratio,3),"level":chosen_level,
+                    "chunks":chunks,"chunk_count":chunk_count,"savings":original_size-stored_size,
+                    "encrypted":True,"ref_count":1,"dedup_bytes_saved":0,"starred":False,
+                    "ml_model_version":ml_version,"entropy":round(entropy,3),"folder_id":folder_id})
 
-    return jsonify({
-        "status":          "uploaded",
-        "file_id":         file_hash,
-        "hash":            file_hash,
-        "filename":        filename,
-        "category":        category,
-        "original_size":   original_size,
-        "stored_size":     stored_size,
-        "ratio":           round(best_ratio, 3),
-        "level":           chosen_level,
-        "chunks":          chunks,
-        "chunk_count":     chunk_count,
-        "savings":         original_size - stored_size,
-        "encrypted":       True,
-        "ref_count":       1,
-        "dedup_bytes_saved": 0,
-        "starred":         False,
-        "ml_model_version": ml_version,
-        "entropy":         round(entropy, 3),
-    })
-
+# ── Files CRUD ────────────────────────────────────────────────────
 
 @app.route("/files", methods=["GET"])
 @require_auth
 def list_files():
-    view  = request.args.get("view", "active")
-    files = db_list_files(g.uid, view)
-
-    # Auto-purge expired trash
-    now     = time.time()
-    cutoff  = now - TRASH_DAYS * 86400
-    to_purge = []
+    view      = request.args.get("view", "active")
+    folder_id = request.args.get("folder_id")
+    files     = db_list_files(g.uid, view, folder_id if view=="active" else None)
+    now       = time.time(); cutoff = now - TRASH_DAYS*86400; to_purge = []
     for f in files:
-        if view == "trash" and f.get("deleted_at"):
+        if view=="trash" and f.get("deleted_at"):
             try:
-                # deleted_at is ISO string from DB
-                from datetime import datetime
                 dt = datetime.fromisoformat(f["deleted_at"].replace("Z","+00:00"))
-                if dt.timestamp() < cutoff:
-                    to_purge.append(f)
-            except Exception:
-                pass
-
+                if dt.timestamp() < cutoff: to_purge.append(f)
+            except Exception: pass
     for f in to_purge:
         try:
             delete_from_storage(g.uid, f["hash"], f.get("chunk_count",0))
             sb.table("files").delete().eq("user_id",g.uid).eq("hash",f["hash"]).execute()
-        except Exception as e:
-            print(f"[purge] {f['hash']}: {e}")
-
+        except Exception as e: print(f"[purge] {e}")
     if to_purge:
         files = [f for f in files if f["hash"] not in {p["hash"] for p in to_purge}]
-
-    # Normalise: add `hash` field if only `id` present (DB stores hash separately)
     for f in files:
-        if "hash" not in f:
-            f["hash"] = f.get("id", "")
-        # upload_time may be ISO string — frontend expects float or string, both fine
+        if "hash" not in f: f["hash"] = f.get("id","")
     return jsonify(files)
-
 
 @app.route("/star/<file_id>", methods=["PATCH"])
 @require_auth
 def toggle_star(file_id):
     row = db_get_file(g.uid, file_id)
-    if not row:
-        return jsonify({"error":"Not found"}), 404
+    if not row: return jsonify({"error":"Not found"}), 404
     new_val = not row.get("starred", False)
     sb.table("files").update({"starred":new_val}).eq("user_id",g.uid).eq("hash",file_id).execute()
     return jsonify({"starred": new_val})
-
 
 @app.route("/trash/<file_id>", methods=["PATCH"])
 @require_auth
 def move_to_trash(file_id):
     row = db_get_file(g.uid, file_id)
-    if not row:
-        return jsonify({"error":"Not found"}), 404
-    from datetime import datetime, timezone
-    sb.table("files").update({
-        "deleted_at": datetime.now(timezone.utc).isoformat(),
-        "starred":    False,
-    }).eq("user_id",g.uid).eq("hash",file_id).execute()
+    if not row: return jsonify({"error":"Not found"}), 404
+    sb.table("files").update({"deleted_at":datetime.now(timezone.utc).isoformat(),"starred":False}) \
+        .eq("user_id",g.uid).eq("hash",file_id).execute()
     return jsonify({"status":"trashed"})
-
 
 @app.route("/restore/<file_id>", methods=["PATCH"])
 @require_auth
 def restore_from_trash(file_id):
     row = db_get_file(g.uid, file_id)
-    if not row:
-        return jsonify({"error":"Not found"}), 404
+    if not row: return jsonify({"error":"Not found"}), 404
     sb.table("files").update({"deleted_at":None}).eq("user_id",g.uid).eq("hash",file_id).execute()
     return jsonify({"status":"restored"})
-
 
 @app.route("/delete/<file_id>", methods=["DELETE"])
 @require_auth
 def delete_file(file_id):
     row = db_get_file(g.uid, file_id)
-    if not row:
-        return jsonify({"error":"Not found"}), 404
-    try:
-        delete_from_storage(g.uid, file_id, row.get("chunk_count",0))
-    except Exception as e:
-        print(f"[delete] storage error: {e}")
+    if not row: return jsonify({"error":"Not found"}), 404
+    try: delete_from_storage(g.uid, file_id, row.get("chunk_count",0))
+    except Exception as e: print(f"[delete] {e}")
     sb.table("files").delete().eq("user_id",g.uid).eq("hash",file_id).execute()
     db_update_stats(g.uid, row.get("original_size",0), row.get("stored_size",0), delete=True)
     broadcast({"type":"file_deleted","file_id":file_id})
     return jsonify({"status":"deleted"})
 
-
 @app.route("/download/<file_id>", methods=["GET"])
 @require_auth
 def download(file_id):
     row = db_get_file(g.uid, file_id)
-    if not row:
-        return jsonify({"error":"Not found"}), 404
-    try:
-        encrypted_blob = storage_download(BLOB_BUCKET, blob_path(g.uid, file_id))
-    except Exception as e:
-        return jsonify({"error":f"Storage fetch failed: {e}"}), 500
-    original = zstd.ZstdDecompressor().decompress(decrypt(encrypted_blob, file_id))
+    if not row: return jsonify({"error":"Not found"}), 404
+    try: blob = storage_download(BLOB_BUCKET, blob_path(g.uid, file_id))
+    except Exception as e: return jsonify({"error":f"Storage fetch failed: {e}"}), 500
+    original = zstd.ZstdDecompressor().decompress(decrypt(blob, file_id))
     return send_file(io.BytesIO(original), download_name=row["filename"], as_attachment=True)
-
 
 @app.route("/stats", methods=["GET"])
 @require_auth
 def stats():
-    # Try DB stats table first, fall back to aggregating files
     try:
-        res = sb.table("user_stats").select("*").eq("user_id",g.uid).limit(1).execute()
-        if res.data:
-            s = res.data[0]
-            return jsonify({
-                "total_files":        s.get("total_files",0),
-                "total_original":     s.get("total_original",0),
-                "total_stored":       s.get("total_stored",0),
-                "space_saved":        s.get("total_original",0)-s.get("total_stored",0),
-                "overall_ratio":      round(s["total_original"]/s["total_stored"],3) if s.get("total_stored") else 1,
-                "total_dedup_events": s.get("total_dedup_events",0),
-                "total_dedup_saved":  s.get("total_dedup_saved",0),
-                "live_peers":         len(peers),
-                "ml_models_trained":  sum(1 for v in _ml_version.values() if v>0),
-            })
+        s = db_get_user_stats(g.uid)
+        used  = s.get("total_stored", 0)
+        quota = s.get("quota_bytes", QUOTA_BYTES)
+        return jsonify({
+            "total_files":        s.get("total_files",0),
+            "total_original":     s.get("total_original",0),
+            "total_stored":       used,
+            "space_saved":        s.get("total_original",0)-used,
+            "overall_ratio":      round(s["total_original"]/used,3) if used else 1,
+            "total_dedup_events": s.get("total_dedup_events",0),
+            "total_dedup_saved":  s.get("total_dedup_saved",0),
+            "live_peers":         len(peers),
+            "ml_models_trained":  sum(1 for v in _ml_version.values() if v>0),
+            "quota_bytes":        quota,
+            "quota_used_pct":     round(used/quota*100,2) if quota else 0,
+        })
     except Exception as e:
-        print(f"[stats] DB error: {e}")
-
-    # Fallback: aggregate from files table
-    files = db_list_files(g.uid, "active")
-    total_orig   = sum(f.get("original_size",0) for f in files)
-    total_stored = sum(f.get("stored_size",0)   for f in files)
-    return jsonify({
-        "total_files":        len(files),
-        "total_original":     total_orig,
-        "total_stored":       total_stored,
-        "space_saved":        total_orig-total_stored,
-        "overall_ratio":      round(total_orig/total_stored,3) if total_stored else 1,
-        "total_dedup_events": sum(f.get("ref_count",1)-1       for f in files),
-        "total_dedup_saved":  sum(f.get("dedup_bytes_saved",0) for f in files),
-        "live_peers":         len(peers),
-        "ml_models_trained":  sum(1 for v in _ml_version.values() if v>0),
-    })
-
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/ml_status", methods=["GET"])
 @require_auth
 def ml_status():
-    """Show ML model status per category — useful for debugging."""
-    status = {}
     with _ml_lock:
-        for cat in CATEGORIES:
-            n = len(_ml_samples.get(cat,[]))
-            status[cat] = {
-                "samples":  n,
-                "version":  _ml_version.get(cat,0),
-                "fitted":   _ml_models.get(cat) is not None,
-                "ready_in": max(0, MIN_SAMPLES_TO_FIT-n),
-            }
-    return jsonify(status)
+        return jsonify({cat: {"samples":len(_ml_samples.get(cat,[])),"version":_ml_version.get(cat,0),
+                              "fitted":_ml_models.get(cat) is not None} for cat in CATEGORIES})
 
+# ── Admin routes ──────────────────────────────────────────────────
+
+@app.route("/admin/stats", methods=["GET"])
+@require_admin
+def admin_stats():
+    """Overall platform stats — total users, storage, network."""
+    try:
+        users_res  = sb.table("user_stats").select("*").execute()
+        users_data = users_res.data or []
+        total_users   = len(users_data)
+        total_stored  = sum(u.get("total_stored",0)   for u in users_data)
+        total_orig    = sum(u.get("total_original",0)  for u in users_data)
+        total_files   = sum(u.get("total_files",0)     for u in users_data)
+        total_dedup   = sum(u.get("total_dedup_events",0) for u in users_data)
+        total_quota   = sum(u.get("quota_bytes", QUOTA_BYTES) for u in users_data)
+        return jsonify({
+            "total_users":        total_users,
+            "total_files":        total_files,
+            "total_stored_bytes": total_stored,
+            "total_orig_bytes":   total_orig,
+            "total_quota_bytes":  total_quota,
+            "platform_saved":     total_orig - total_stored,
+            "total_dedup_events": total_dedup,
+            "live_peers":         len(peers),
+            "ml_models_trained":  sum(1 for v in _ml_version.values() if v>0),
+            "peers":              peer_summary(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/users", methods=["GET"])
+@require_admin
+def admin_users():
+    """Per-user breakdown for the admin dashboard."""
+    try:
+        stats_res = sb.table("user_stats").select("*").execute()
+        users_res = sb.from_("users").select("id,email,created_at").execute() if False else None
+        # user_stats joined with auth.users is not directly accessible via client
+        # Return stats with user_id — frontend can display user_id until we add email lookup
+        return jsonify(stats_res.data or [])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/peers", methods=["GET"])
+@require_admin
+def admin_peers():
+    return jsonify({"count": len(peers), "peers": peer_summary()})
 
 @app.route("/peers", methods=["GET"])
 def list_peers():
     return jsonify({"count": len(peers), "peers": peer_summary()})
 
-
 if __name__ == "__main__":
-    # Dynamically bind to the port provided by your cloud host (defaulting to 5000)
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(debug=True, port=5000, threaded=True)

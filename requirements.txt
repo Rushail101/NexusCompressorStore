@@ -1,9 +1,12 @@
 flask
-flask-sock
 flask-cors
-supabase
-PyJWT
+flask-sock
 zstandard
 cryptography
+PyJWT
+supabase
 scikit-learn
 numpy
+gunicorn
+gevent
+gevent-websocket

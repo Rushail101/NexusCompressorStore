@@ -1,0 +1,9 @@
+flask
+flask-sock
+flask-cors
+supabase
+PyJWT
+zstandard
+cryptography
+scikit-learn
+numpy

@@ -16,9 +16,8 @@ const SUPABASE_URL      = "https://hoqzrxxqczxwwnqimvxm.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhvcXpyeHhxY3p4d3ducWltdnhtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyNzAzMzgsImV4cCI6MjA4Mjg0NjMzOH0.KWrM31jwQu98qevgPKbSzEIrsulKpjxiBQ1X4QlkHFc";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-const API    = "http://localhost:5000";
-const WS_URL = "ws://localhost:5000/ws";
-
+const API    = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:5000/ws";
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const fmt = (bytes) => {

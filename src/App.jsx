@@ -17,8 +17,8 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const ADMIN_EMAIL = "rushailharjai10@gmail.com";
 
-const API    = "http://localhost:5000";
-const WS_URL = "ws://localhost:5000/ws";
+const API    = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:5000/ws";
 
 // ── Helpers ───────────────────────────────────────────────────────
 

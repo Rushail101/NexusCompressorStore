@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: nexus-poc
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt && npm install && npm run build
+    startCommand: gunicorn --worker-class gevent --workers 1 --bind "0.0.0.0:$PORT" --timeout 120 server:app
+    envVars:
+      - key: SUPABASE_URL
+        value: https://hoqzrxxqczxwwnqimvxm.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: MASTER_SECRET
+        generateValue: true
+      - key: RENDER
+        value: "true"
+      - key: ADMIN_EMAIL
+        value: rushailharjai10@gmail.com

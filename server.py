@@ -37,6 +37,7 @@ app  = Flask(__name__)
 
 # Allow requests from Vite dev server (5173) and any other local port.
 # In production replace with your actual domain.
+# Allow requests from local dev servers and your production Vercel domain.
 CORS(app,
      resources={r"/*": {"origins": [
          "http://localhost:5173",
@@ -44,6 +45,7 @@ CORS(app,
          "http://localhost:5174",
          "http://127.0.0.1:5173",
          "http://127.0.0.1:3000",
+         "https://nexus-compressor-store.vercel.app"  # Your production frontend domain
      ]}},
      supports_credentials=True,
      allow_headers=["Authorization", "Content-Type"],
@@ -51,7 +53,6 @@ CORS(app,
      expose_headers=["Content-Disposition"],
 )
 sock = Sock(app)
-
 # ── Config ────────────────────────────────────────────────────────────────────
 
 # ── Config ────────────────────────────────────────────────────────────────────

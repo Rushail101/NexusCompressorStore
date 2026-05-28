@@ -158,7 +158,11 @@ function ShareModal({ file, token, onClose }) {
         {shares.length > 0 && (
           <div style={{marginTop:14,maxHeight:100,overflowY:"auto"}}>
             <p style={{fontSize:10,color:"#333",margin:"0 0 4px"}}>PROVISIONED_TARGETS</p>
-            {shares.map(s=><div key={s.shared_with} style={{fontSize:11,color:"#666",padding:"3px 0"}}>• {s.shared_with} <span style={{color:"#333"}}>({relTime(s.created_at)})</span></div>)}
+            {{shares.map(s => (
+                <div key={s.shared_with} style={{ fontSize: 12, color: "#aaa", padding: "4px 0" }}>
+                  • {s.shared_with} <span style={{ fontSize: 10, color: "#444" }}>({relTime(s.created_at)})</span>
+                </div>
+              ))}
           </div>
         )}
       </div>

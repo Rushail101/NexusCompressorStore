@@ -1,13 +1,14 @@
 """
 Nexus Production Server – Phase 10 (Sprint 3 Core Delivery Engine)
 ===================================================================
-Core Features:
-  - Feature 1: Client-Side Pre-Compression (WASM Header Handshake Bypass)
+Aesthetic: Cyberpunk Industrial High-Contrast Dashboard
+Features:
+  - Feature 1: Client-Side Pre-Compression (WASM Header Bypass)
   - Feature 2: Resumable Chunked Upload Tracking Framework
-  - Feature 3: Tokenized Anonymous Public Share Links & Secure Joined List Resolvers
+  - Feature 3: Tokenized Anonymous Public Share Links (Fixed List Object Join Bug)
   - Sprint 1: Global Multi-Folder Index Search, Checkbox Bulk Actions, HTML5 Drag-and-Drop
   - Sprint 2: Automated Incremental File Versioning, Secure Private Email Sharing, Immutable Auditing Log Feed
-  - Sprint 3: Chunked Context Streaming Generators, Memory Optimized Decryption Pipelines, Fixed API Prefixes
+  - Sprint 3: Chunked Context Streaming Generators, Memory Optimized Decryption Pipelines
 """
 
 from flask import Flask, request, jsonify, send_file, send_from_directory, g, Response, stream_with_context
@@ -64,7 +65,6 @@ NONCE_SIZE          = 12
 ML_MODEL_DIR        = "./ml_models"
 UPLOAD_SESSIONS_DIR = "./upload_sessions"
 
-# Sprint 3 Routing Prefixes Definition Block
 API_PREFIXES = (
     "/upload", "/files", "/folders", "/share", "/shared-with-me",
     "/p/", "/star/", "/trash/", "/restore/", "/delete/",
@@ -75,7 +75,7 @@ os.makedirs(ML_MODEL_DIR, exist_ok=True)
 os.makedirs(UPLOAD_SESSIONS_DIR, exist_ok=True)
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-print(f"[nexus] Phase 10 Streaming Kernel Ready → {SUPABASE_URL}")
+print(f"[nexus] Cyberpunk Kernel Engine Core Live → {SUPABASE_URL}")
 
 # ── Master secret ─────────────────────────────────────────────────────────────
 
@@ -144,7 +144,7 @@ def require_admin(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── Activity Auditing Helper ──────────────────────────────────────────────────
+# ── Sprint 2: Activity Auditing Logging Helper ────────────────────────────────
 
 def log_activity(uid, action_type, filename, size=0, destination=None):
     try:
@@ -152,7 +152,7 @@ def log_activity(uid, action_type, filename, size=0, destination=None):
             "user_id": uid, "action_type": action_type,
             "metadata": {"filename": filename, "bytes": size, "destination": destination, "timestamp": datetime.now(timezone.utc).isoformat()}
         }).execute()
-    except Exception as e: print(f"[audit-log-error] {e}")
+    except Exception as e: print(f"[audit-log-error] Failed to log activity: {e}")
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
@@ -266,7 +266,7 @@ def best_level_ml(cat, sz, ent):
     return bl
 _load_models()
 
-# ── Storage Matrix Handlers ───────────────────────────────────────────────────
+# ── Storage Handlers ──────────────────────────────────────────────────────────
 
 def storage_upload(bucket, path, data): sb.storage.from_(bucket).upload(path, data, file_options={"content-type": "application/octet-stream", "upsert": "true"})
 def storage_download(bucket, path): return sb.storage.from_(bucket).download(path)
@@ -285,8 +285,17 @@ def delete_from_storage(uid, fh, chunk_count):
     storage_delete(BLOB_BUCKET, [blob_path(uid, fh)])
     paths = [chunk_path(uid, fh, i) for i in range(chunk_count)]
     if paths: storage_delete(CHUNK_BUCKET, paths)
+def file_category(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in [".jpg",".jpeg",".png",".gif",".webp",".bmp"]: return "image"
+    if ext in [".mp4",".mkv",".avi",".mov",".webm"]:         return "video"
+    if ext in [".mp3",".wav",".flac",".aac",".ogg"]:         return "audio"
+    if ext in [".pdf",".doc",".docx",".txt",".md"]:          return "document"
+    if ext in [".zip",".gz",".tar",".rar",".7z"]:            return "archive"
+    if ext in [".py",".js",".ts",".jsx",".json",".html",".css",".cpp",".c",".java"]: return "code"
+    return "other"
 
-# ── Processor Core Pipe ───────────────────────────────────────────────────────
+# ── Processing Engine Pipe ────────────────────────────────────────────────────
 
 def _process_and_store(uid, filename, original_data, folder_id=None, pre_compressed=False, client_original_size=None, client_entropy=None):
     category   = file_category(filename)
@@ -327,7 +336,7 @@ def _process_and_store(uid, filename, original_data, folder_id=None, pre_compres
     broadcast({"type": "file_available", "file_id": file_hash, "filename": filename, "chunk_count": len(chunks)})
     return {"status": "uploaded", "file_id": file_hash, "hash": file_hash, "filename": filename, "category": category, "original_size": original_size, "stored_size": stored_size, "ratio": round(best_ratio, 3), "chunk_count": len(chunks), "version_number": next_version}
 
-# ── Feature 2: Resumable Tracking Dictionaries ────────────────────────────────
+# ── Feature 2: Resumable Tracking Helpers ─────────────────────────────────────
 
 def _session_path(sid): return os.path.join(UPLOAD_SESSIONS_DIR, sid)
 def _load_session(sid):
@@ -342,7 +351,7 @@ def _cleanup_session(sid):
         try: os.remove(p)
         except Exception: pass
 
-# ── WebSockets & Specialized Node Signaling Framework ─────────────────────────
+# ── WebSockets Peer Node Signaling ────────────────────────────────────────────
 
 peers = {}; peers_lock = threading.Lock()
 def peer_summary():
@@ -373,35 +382,29 @@ def websocket(ws):
     finally:
         with peers_lock: peers.pop(pid, None)
 
-# ── Sprint 3: Memory Optimized Streaming Decompressor Generator ───────────────
+# ── Sprint 3: Chunked Streaming Generator Pipeline ────────────────────────────
 
 def generate_decrypted_stream(uid, file_hash):
-    """Downloads encrypted storage footprint blocks, streaming chunks directly to response context."""
     try:
-        # Pull down raw base storage layer binary chunk array
         blob = storage_download(BLOB_BUCKET, blob_path(uid, file_hash))
         decrypted = decrypt(blob, file_hash)
-        
-        # Stream output via buffer sizes to prevent platform heap explosions
-        decompressor = zstd.ZstdDecompressor()
-        uncompressed = decompressor.decompress(decrypted)
-        
+        uncompressed = zstd.ZstdDecompressor().decompress(decrypted)
         buffer = io.BytesIO(uncompressed)
         while True:
-            chunk = buffer.read(512 * 1024) # Send 512 KB segments iteratively
+            chunk = buffer.read(512 * 1024)
             if not chunk: break
             yield chunk
     except Exception as stream_err:
-        print(f"[streaming-exception-layer] Framework break: {stream_err}")
+        print(f"[streaming-err] {stream_err}")
         yield b""
 
-# ── API Paths & Endpoint Management ───────────────────────────────────────────
+# ── API Endpoint Mappings ─────────────────────────────────────────────────────
 
 @app.route("/upload", methods=["POST"])
 @require_auth
 def upload():
     file = request.files.get("file")
-    if not file: return jsonify({"error": "No file payload found"}), 400
+    if not file: return jsonify({"error": "No file"}), 400
     result = _process_and_store(g.uid, file.filename, file.read(), request.form.get("folder_id"))
     return jsonify(result)
 
@@ -482,8 +485,6 @@ def move_file(file_hash):
     sb.table("files").update({"folder_id": target}).eq("hash", file_hash).eq("user_id", g.uid).execute()
     return jsonify({"status": "moved"})
 
-# ── Sprint 2 Shared Assets Engine: Private Email-to-Email Sharing ─────────────
-
 @app.route("/share/<file_hash>", methods=["POST"])
 @require_auth
 def share_file(file_hash):
@@ -527,15 +528,13 @@ def get_logs():
     res = sb.table("activity_logs").select("*").eq("user_id", g.uid).order("created_at", desc=True).limit(50).execute()
     return jsonify(res.data or [])
 
-# ── Sprint 3: Fully Upgraded Memory Buffer Core Downloader ────────────────────
+# ── Sprint 3: High-Performance Streaming Endpoint ─────────────────────────────
 
 @app.route("/download/<file_id>", methods=["GET"])
 @require_auth
 def download(file_id):
     row = db_get_file(g.uid, file_id)
-    if not row: return jsonify({"error": "Asset reference dropped"}), 404
-    
-    # Return zero-RAM context stream response generators to maximize speed efficiency
+    if not row: return jsonify({"error": "Asset dropped"}), 404
     return Response(
         stream_with_context(generate_decrypted_stream(g.uid, file_id)),
         mimetype="application/octet-stream",
@@ -545,11 +544,10 @@ def download(file_id):
 @app.route("/p/<token>", methods=["GET"])
 def public_download(token):
     res = sb.table("shared_files").select("owner_id,files(hash,filename)").eq("share_token", token).is_("shared_with", "null").limit(1).execute()
-    if not res.data: return jsonify({"error": "Link boundary expired"}), 404
+    if not res.data: return jsonify({"error": "Expired link"}), 404
     share = res.data[0]
     files_data = share.get("files", [])
     fi = files_data[0] if isinstance(files_data, list) else (files_data if isinstance(files_data, dict) else {})
-    
     return Response(
         stream_with_context(generate_decrypted_stream(share.get("owner_id"), fi.get("hash"))),
         mimetype="application/octet-stream",
@@ -574,12 +572,12 @@ def stats():
     s = db_get_user_stats(g.uid)
     return jsonify({"total_files": s.get("total_files", 0), "total_original": s.get("total_original", 0), "total_stored": s.get("total_stored", 0), "quota_bytes": s.get("quota_bytes", QUOTA_BYTES), "dynamic_quota_bonus": s.get("dynamic_quota_bonus", 0), "balance_usd": float(s.get("balance_usd", 0.0)), "current_plan": s.get("current_plan", "Option_A_Eco")})
 
-# ── Catchall Single Page App Production asset serve handler ───────────────────
+# ── React serving ─────────────────────────────────────────────────────────────
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_react(path):
-    if any(("/" + path).startswith(p) for p in API_PREFIXES): return jsonify({"error": "API route target path mismatch"}), 404
+    if any(("/" + path).startswith(p) for p in API_PREFIXES): return jsonify({"error": "API collision"}), 404
     dist = os.path.join(os.path.dirname(__file__), "dist")
     if not os.path.exists(dist): return jsonify({"status": "online", "version": "Phase 10 Kernel"}), 200
     if path and os.path.exists(os.path.join(dist, path)): return send_from_directory(dist, path)

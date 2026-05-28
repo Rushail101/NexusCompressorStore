@@ -1,11 +1,17 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
   <head>
-    <script src="https://cdn.jsdelivr.net/npm/zstd-codec@0.1.2/bundle/zstd-codec.min.js"></script>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>nexus-frontend</title>
+    <title>Nexus</title>
+    <meta name="description" content="Nexus — compressed, encrypted, P2P cloud storage" />
+
+    <!--
+      zstd-codec: enables client-side compression in the browser via WASM.
+      Feature 1 (client-side compression) requires this script.
+      Without it, the app falls back to server-side compression automatically.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/zstd-codec@0.1.2/bundle/zstd-codec.min.js"></script>
   </head>
   <body>
     <div id="root"></div>

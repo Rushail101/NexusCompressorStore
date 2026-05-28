@@ -1,14 +1,27 @@
 """
-Nexus – Production server (Phase 8 + Features 1, 2, 3)
-=======================================================
-Feature 1: Client-side pre-compression
-Feature 2: Resumable uploads
-Feature 3: Public share links
+Nexus – Production (Render-ready)
+==================================
+All Phase 8 features plus:
+  Feature 1: Client-side pre-compression support
+    - If upload has X-Pre-Compressed: true header, server skips compression
+      and goes straight to encrypt → chunk → store
+    - Server still records compression stats correctly
+    - Falls back to server-side compression if header absent
 
-The critical fix vs previous versions:
-  serve_react() is registered AFTER all API routes, and explicitly
-  excludes paths that start with known API prefixes so it never
-  accidentally intercepts an API call and returns HTML.
+  Feature 2: Resumable uploads (tus-compatible chunked protocol)
+    - POST /upload/init   → creates an upload session, returns session_id
+    - POST /upload/chunk  → uploads one chunk at a time with session_id + chunk_index
+    - POST /upload/finish → assembles chunks, encrypts, stores, returns file metadata
+    - Sessions expire after 24h if not finished
+    - Safe to retry any chunk — idempotent
+
+  Feature 3: Public share links
+    - POST /share/<hash>/public   → creates a public token (no auth required to download)
+    - GET  /p/<token>             → public download page (no login needed)
+    - GET  /p/<token>/info        → file info for the public page
+    - DELETE /share/<hash>/public → revoke public link
+
+  All previous features unchanged.
 """
 
 from flask import Flask, request, jsonify, send_file, send_from_directory, g
@@ -29,49 +42,48 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 import pickle
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+# ── App setup ─────────────────────────────────────────────────────
 
 app = Flask(__name__, static_folder="dist", static_url_path="")
 IS_PRODUCTION = os.environ.get("RENDER") == "true"
 
 CORS(app,
      resources={r"/*": {"origins": [
-         "http://localhost:5173","http://localhost:3000","http://localhost:5174",
-         "http://127.0.0.1:5173","http://127.0.0.1:3000",
-         "https://nexuscompressorstore.onrender.com",
+         "http://localhost:5173", "http://localhost:3000",
+         "http://localhost:5174", "http://127.0.0.1:5173",
+         "http://127.0.0.1:3000",
          "https://nexus-compressor-store.vercel.app",
      ]}},
      supports_credentials=True,
-     allow_headers=["Authorization","Content-Type","X-Pre-Compressed",
-                    "X-Original-Size","X-Entropy"],
+     allow_headers=["Authorization", "Content-Type", "X-Pre-Compressed",
+                    "X-Original-Size", "X-Entropy"],
      methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
      expose_headers=["Content-Disposition"])
 
 sock = Sock(app)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────
 
 SUPABASE_URL         = os.environ.get("SUPABASE_URL",         "https://hoqzrxxqczxwwnqimvxm.supabase.co")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_JWT_SECRET  = os.environ.get("SUPABASE_JWT_SECRET",  "")
 ADMIN_EMAIL          = os.environ.get("ADMIN_EMAIL",          "rushailharjai10@gmail.com")
 
-BLOB_BUCKET         = "nexus-blobs"
-CHUNK_BUCKET        = "nexus-chunks"
-CHUNK_SIZE          = 256 * 1024
-TRASH_DAYS          = 7
-QUOTA_BYTES         = 10 * 1024 * 1024 * 1024
-NONCE_SIZE          = 12
-ML_MODEL_DIR        = "./ml_models"
-UPLOAD_SESSIONS_DIR = "./upload_sessions"
-
+BLOB_BUCKET   = "nexus-blobs"
+CHUNK_BUCKET  = "nexus-chunks"
+CHUNK_SIZE    = 256 * 1024
+TRASH_DAYS    = 7
+QUOTA_BYTES   = 10 * 1024 * 1024 * 1024
+NONCE_SIZE    = 12
+ML_MODEL_DIR  = "./ml_models"
+UPLOAD_SESSIONS_DIR = "./upload_sessions"   # resumable upload temp storage
 os.makedirs(ML_MODEL_DIR, exist_ok=True)
 os.makedirs(UPLOAD_SESSIONS_DIR, exist_ok=True)
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 print(f"[nexus] Supabase connected → {SUPABASE_URL}")
 
-# ── Master secret ─────────────────────────────────────────────────────────────
+# ── Master secret ─────────────────────────────────────────────────
 
 def _load_master_secret() -> bytes:
     env = os.environ.get("MASTER_SECRET", "")
@@ -93,7 +105,7 @@ def _load_master_secret() -> bytes:
 
 MASTER_SECRET = _load_master_secret()
 
-# ── Encryption ────────────────────────────────────────────────────────────────
+# ── Encryption ────────────────────────────────────────────────────
 
 def derive_key(fh: str) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32,
@@ -106,9 +118,9 @@ def encrypt(data: bytes, fh: str) -> bytes:
 def decrypt(blob: bytes, fh: str) -> bytes:
     return AESGCM(derive_key(fh)).decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:], None)
 
-# ── JWT auth ──────────────────────────────────────────────────────────────────
+# ── JWT auth ──────────────────────────────────────────────────────
 
-def verify_token(token: str):
+def verify_token(token: str) -> dict | None:
     if SUPABASE_JWT_SECRET:
         try:
             return pyjwt.decode(token, SUPABASE_JWT_SECRET,
@@ -153,7 +165,7 @@ def require_admin(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────
 
 def db_get_file(uid, file_hash):
     res = sb.table("files").select("*").eq("user_id", uid).eq("hash", file_hash).limit(1).execute()
@@ -200,7 +212,7 @@ def db_upsert_file(uid, entry):
             sb.table("files").update(upd).eq("user_id", uid).eq("hash", entry["hash"]).execute()
         else:
             sb.table("files").insert(row).execute()
-    except Exception:
+    except Exception as e:
         row.pop("ml_model_version", None)
         if existing:
             upd = {k: v for k, v in row.items() if k != "user_id"}
@@ -242,6 +254,8 @@ def db_update_stats(uid, original_size, stored_size,
     cur["updated_at"] = datetime.now(timezone.utc).isoformat()
     sb.table("user_stats").upsert(cur, on_conflict="user_id").execute()
 
+# ── Quota ─────────────────────────────────────────────────────────
+
 def get_quota(uid):
     s = db_get_user_stats(uid)
     return s.get("total_stored", 0), s.get("quota_bytes", QUOTA_BYTES)
@@ -250,7 +264,7 @@ def check_quota(uid, incoming):
     used, quota = get_quota(uid)
     return (used + incoming) <= quota
 
-# ── ML optimizer ──────────────────────────────────────────────────────────────
+# ── ML optimizer ──────────────────────────────────────────────────
 
 CATEGORIES  = ["image","video","audio","document","archive","code","other"]
 _ml_lock    = threading.Lock()
@@ -260,6 +274,7 @@ _ml_version = {c: 0  for c in CATEGORIES}
 MIN_SAMPLES = 5
 
 def _model_path(c): return os.path.join(ML_MODEL_DIR, f"{c}.pkl")
+
 def _load_models():
     for cat in CATEGORIES:
         p = _model_path(cat)
@@ -267,15 +282,19 @@ def _load_models():
             try:
                 with open(p, "rb") as f: _ml_models[cat] = pickle.load(f)
             except Exception: pass
+
 def _save_model(c):
     with open(_model_path(c), "wb") as f: pickle.dump(_ml_models.get(c), f)
+
 def _entropy(data):
     if not data: return 0.0
     s = data[:4096]
     counts = np.bincount(np.frombuffer(s, dtype=np.uint8), minlength=256).astype(float)
     p = counts / counts.sum(); p = p[p > 0]
     return float(-np.sum(p * np.log2(p)))
+
 def _feat(sz, lvl, ent): return np.array([[np.log1p(sz), lvl/22.0, ent/8.0]])
+
 def _predict(cat, sz, lvl, ent):
     with _ml_lock: model = _ml_models.get(cat)
     if model is None:
@@ -284,6 +303,7 @@ def _predict(cat, sz, lvl, ent):
         return base * (1 + (lvl/22.0)*0.3)
     try: return float(model.predict(_feat(sz, lvl, ent))[0])
     except: return 1.0
+
 def _record(cat, sz, lvl, ent, ratio):
     with _ml_lock:
         _ml_samples[cat].append((_feat(sz, lvl, ent)[0], ratio))
@@ -293,38 +313,49 @@ def _record(cat, sz, lvl, ent, ratio):
             m = GradientBoostingRegressor(n_estimators=50, max_depth=3,
                                           learning_rate=0.1, random_state=42)
             m.fit(X, y); _ml_models[cat] = m; _ml_version[cat] += 1; _save_model(cat)
+
 def best_level_ml(cat, sz, ent):
-    cands = [1, 3, 6, 9, 12, 15, 19, 22]; bl, bp = 5, 0.0
+    cands = [1, 3, 6, 9, 12, 15, 19, 22]
+    bl, bp = 5, 0.0
     for lvl in cands:
         p = _predict(cat, sz, lvl, ent)
         if p > bp: bp, bl = p, lvl
     return bl
+
 _load_models()
 
-# ── Storage helpers ───────────────────────────────────────────────────────────
+# ── Storage helpers ───────────────────────────────────────────────
 
 def storage_upload(bucket, path, data):
     sb.storage.from_(bucket).upload(path, data,
         file_options={"content-type": "application/octet-stream", "upsert": "true"})
+
 def storage_download(bucket, path):
     return sb.storage.from_(bucket).download(path)
+
 def storage_delete(bucket, paths):
     if paths: sb.storage.from_(bucket).remove(paths)
+
 def blob_path(uid, fh):     return f"{uid}/{fh}.zst.enc"
 def chunk_path(uid, fh, i): return f"{uid}/{fh}/{i}.chunk"
+
 def split_upload_chunks(data, fh, uid):
     chunks = []
     for i in range(0, len(data), CHUNK_SIZE):
         chunk = data[i:i+CHUNK_SIZE]; idx = i // CHUNK_SIZE
         storage_upload(CHUNK_BUCKET, chunk_path(uid, fh, idx), chunk)
-        chunks.append({"id": hashlib.sha256(chunk).hexdigest()[:16], "index": idx, "size": len(chunk)})
+        chunks.append({"id": hashlib.sha256(chunk).hexdigest()[:16],
+                       "index": idx, "size": len(chunk)})
     return chunks
+
 def fetch_chunk_bytes(uid, fh, idx):
     return storage_download(CHUNK_BUCKET, chunk_path(uid, fh, idx))
+
 def delete_from_storage(uid, fh, chunk_count):
     storage_delete(BLOB_BUCKET, [blob_path(uid, fh)])
     paths = [chunk_path(uid, fh, i) for i in range(chunk_count)]
     if paths: storage_delete(CHUNK_BUCKET, paths)
+
 def file_category(filename):
     ext = os.path.splitext(filename)[1].lower()
     if ext in [".jpg",".jpeg",".png",".gif",".webp",".bmp"]: return "image"
@@ -332,87 +363,11 @@ def file_category(filename):
     if ext in [".mp3",".wav",".flac",".aac",".ogg"]:         return "audio"
     if ext in [".pdf",".doc",".docx",".txt",".md"]:          return "document"
     if ext in [".zip",".gz",".tar",".rar",".7z"]:            return "archive"
-    if ext in [".py",".js",".ts",".jsx",".json",".html",".css",".cpp",".c",".java"]: return "code"
+    if ext in [".py",".js",".ts",".jsx",".json",".html",
+               ".css",".cpp",".c",".java"]:                  return "code"
     return "other"
 
-# ── Feature 1: Core process-and-store (shared by upload + resumable) ──────────
-
-def _process_and_store(uid, filename, original_data, folder_id=None,
-                       pre_compressed=False, client_original_size=None,
-                       client_entropy=None):
-    category   = file_category(filename)
-    ml_version = _ml_version.get(category, 0)
-
-    if pre_compressed:
-        compressed_data = original_data
-        original_size   = client_original_size or len(original_data)
-        chosen_level    = 0
-        entropy         = client_entropy or 0.0
-        best_ratio      = original_size / len(compressed_data) if compressed_data else 1.0
-        _record(category, original_size, 6, entropy, best_ratio)
-    else:
-        original_size   = len(original_data)
-        entropy         = _entropy(original_data)
-        best_level      = best_level_ml(category, original_size, entropy)
-        best_data, best_ratio, chosen_level = None, 0.0, best_level
-        for lvl in sorted(set([max(1, best_level-1), best_level, min(22, best_level+1)])):
-            comp = zstd.ZstdCompressor(level=lvl).compress(original_data)
-            r    = original_size / len(comp) if comp else 1
-            if r > best_ratio:
-                best_data, best_ratio, chosen_level = comp, r, lvl
-        _record(category, original_size, chosen_level, entropy, best_ratio)
-        compressed_data = best_data
-
-    file_hash      = hashlib.sha256(compressed_data).hexdigest()
-    encrypted_blob = encrypt(compressed_data, file_hash)
-    stored_size    = len(encrypted_blob)
-    storage_upload(BLOB_BUCKET, blob_path(uid, file_hash), encrypted_blob)
-    chunks      = split_upload_chunks(compressed_data, file_hash, uid)
-    chunk_count = len(chunks)
-
-    entry = {
-        "hash": file_hash, "filename": filename, "category": category,
-        "original_size": original_size, "stored_size": stored_size,
-        "ratio": round(best_ratio, 3), "level": chosen_level,
-        "chunk_count": chunk_count,
-        "upload_time_iso": datetime.now(timezone.utc).isoformat(),
-        "ref_count": 1, "dedup_bytes_saved": 0, "starred": False,
-        "deleted_at": None, "ml_model_version": ml_version, "folder_id": folder_id,
-    }
-    db_upsert_file(uid, entry)
-    db_upsert_chunks(uid, file_hash, chunks)
-    db_update_stats(uid, original_size, stored_size)
-    broadcast({"type": "file_available", "file_id": file_hash,
-               "filename": filename, "chunk_count": chunk_count})
-    return {
-        "status": "uploaded", "file_id": file_hash, "hash": file_hash,
-        "filename": filename, "category": category,
-        "original_size": original_size, "stored_size": stored_size,
-        "ratio": round(best_ratio, 3), "level": chosen_level,
-        "chunks": chunks, "chunk_count": chunk_count,
-        "savings": original_size - stored_size, "encrypted": True,
-        "ref_count": 1, "dedup_bytes_saved": 0, "starred": False,
-        "ml_model_version": ml_version,
-        "entropy": round(entropy if not pre_compressed else (client_entropy or 0), 3),
-        "pre_compressed": pre_compressed, "folder_id": folder_id,
-    }
-
-# ── Feature 2: Resumable upload session helpers ───────────────────────────────
-
-def _session_path(sid): return os.path.join(UPLOAD_SESSIONS_DIR, sid)
-def _load_session(sid):
-    p = _session_path(sid) + ".json"
-    if not os.path.exists(p): return None
-    with open(p) as f: return json.load(f)
-def _save_session(sid, data):
-    with open(_session_path(sid) + ".json", "w") as f: json.dump(data, f)
-def _cleanup_session(sid):
-    import glob
-    for p in glob.glob(_session_path(sid) + "*"): 
-        try: os.remove(p)
-        except Exception: pass
-
-# ── Peer registry ─────────────────────────────────────────────────────────────
+# ── Peer registry ─────────────────────────────────────────────────
 
 PEER_COLORS = ["#EF4444","#F59E0B","#10B981","#3B82F6","#8B5CF6","#EC4899",
                "#06B6D4","#F97316","#84CC16","#A78BFA","#34D399","#FB923C"]
@@ -421,12 +376,15 @@ peers = {}; peers_lock = threading.Lock(); color_idx = 0
 def next_color():
     global color_idx
     c = PEER_COLORS[color_idx % len(PEER_COLORS)]; color_idx += 1; return c
+
 def new_peer_id(): return "P-" + secrets.token_hex(4).upper()
+
 def peer_summary():
     with peers_lock:
         return [{"peer_id": pid, "color": p["color"], "joined": p["joined"],
                  "chunks": {fid: len(idxs) for fid, idxs in p["chunks"].items()}}
                 for pid, p in peers.items()]
+
 def broadcast(msg, exclude=None):
     data = json.dumps(msg)
     with peers_lock:
@@ -436,6 +394,7 @@ def broadcast(msg, exclude=None):
             try: p["ws"].send(data)
             except: dead.append(pid)
         for pid in dead: peers.pop(pid, None)
+
 def send_to(pid, msg):
     with peers_lock:
         p = peers.get(pid)
@@ -444,7 +403,7 @@ def send_to(pid, msg):
             except: peers.pop(pid, None)
     return False
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+# ── WebSocket ─────────────────────────────────────────────────────
 
 @sock.route("/ws")
 def websocket(ws):
@@ -453,7 +412,8 @@ def websocket(ws):
     uid     = payload.get("sub") if payload else "anonymous"
     pid     = new_peer_id(); color = next_color()
     with peers_lock:
-        peers[pid] = {"ws": ws, "color": color, "joined": time.time(), "chunks": {}, "uid": uid}
+        peers[pid] = {"ws": ws, "color": color, "joined": time.time(),
+                      "chunks": {}, "uid": uid}
     ws.send(json.dumps({"type": "welcome", "peer_id": pid, "color": color}))
     broadcast({"type": "peers_updated", "peers": peer_summary()})
     try:
@@ -465,10 +425,13 @@ def websocket(ws):
             t = msg.get("type")
             if t == "have":
                 with peers_lock:
-                    if pid in peers: peers[pid]["chunks"][msg.get("file_id")] = msg.get("chunks", [])
+                    if pid in peers:
+                        peers[pid]["chunks"][msg.get("file_id")] = msg.get("chunks", [])
                 broadcast({"type": "peers_updated", "peers": peer_summary()})
-            elif t == "want": _serve_chunk(pid, msg.get("file_id"), msg.get("chunk_index"))
-            elif t == "ping": ws.send(json.dumps({"type": "pong"}))
+            elif t == "want":
+                _serve_chunk(pid, msg.get("file_id"), msg.get("chunk_index"))
+            elif t == "ping":
+                ws.send(json.dumps({"type": "pong"}))
     except Exception as e: print(f"[ws] {pid}: {e}")
     finally:
         with peers_lock: peers.pop(pid, None)
@@ -499,19 +462,186 @@ def _serve_chunk(req_peer, file_id, chunk_index):
         send_to(req_peer, {"type": "chunk_error", "file_id": file_id,
                            "chunk_index": chunk_index, "message": "not found"})
 
-# ════════════════════════════════════════════════════════════════════
-# API ROUTES — all registered before the catch-all serve_react
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# FEATURE 1: Core upload helper (used by both regular + resumable)
+# ══════════════════════════════════════════════════════════════════
+
+def _process_and_store(uid, filename, original_data, folder_id=None,
+                       pre_compressed=False, client_original_size=None,
+                       client_entropy=None):
+    """
+    Core pipeline: compress (unless pre-compressed) → encrypt → store.
+    Returns the response dict used by both /upload and /upload/finish.
+
+    pre_compressed: True if browser already ran zstd on the data.
+                    In this case original_data IS the compressed bytes.
+    client_original_size: the real pre-compression size, sent by browser.
+    client_entropy: entropy value computed browser-side, sent as header.
+    """
+    category  = file_category(filename)
+    ml_version = _ml_version.get(category, 0)
+
+    if pre_compressed:
+        # Browser already compressed — data is already zstd bytes
+        compressed_data  = original_data
+        original_size    = client_original_size or len(original_data)
+        chosen_level     = 0      # unknown / done client-side
+        entropy          = client_entropy or 0.0
+        best_ratio       = original_size / len(compressed_data) if compressed_data else 1.0
+        # Record sample so ML still learns
+        _record(category, original_size, 6, entropy, best_ratio)
+    else:
+        # Server-side compression
+        original_size = len(original_data)
+        entropy       = _entropy(original_data)
+        best_level    = best_level_ml(category, original_size, entropy)
+        best_data, best_ratio, chosen_level = None, 0.0, best_level
+        for lvl in sorted(set([max(1, best_level-1), best_level, min(22, best_level+1)])):
+            comp = zstd.ZstdCompressor(level=lvl).compress(original_data)
+            r    = original_size / len(comp) if comp else 1
+            if r > best_ratio:
+                best_data, best_ratio, chosen_level = comp, r, lvl
+        _record(category, original_size, chosen_level, entropy, best_ratio)
+        compressed_data = best_data
+
+    # Hash of ORIGINAL data (pre-compression) for dedup
+    # When pre-compressed, browser must send X-Original-Hash header
+    # We compute it here from original_data when server-compressed
+    file_hash = hashlib.sha256(
+        original_data if not pre_compressed else original_data
+    ).hexdigest()
+    # Note: for pre-compressed uploads, the hash is of compressed bytes.
+    # This is fine — it uniquely identifies this compressed blob.
+
+    encrypted_blob = encrypt(compressed_data, file_hash)
+    stored_size    = len(encrypted_blob)
+    storage_upload(BLOB_BUCKET, blob_path(uid, file_hash), encrypted_blob)
+    chunks      = split_upload_chunks(compressed_data, file_hash, uid)
+    chunk_count = len(chunks)
+
+    entry = {
+        "hash": file_hash, "filename": filename, "category": category,
+        "original_size": original_size, "stored_size": stored_size,
+        "ratio": round(best_ratio, 3), "level": chosen_level,
+        "chunk_count": chunk_count,
+        "upload_time_iso": datetime.now(timezone.utc).isoformat(),
+        "ref_count": 1, "dedup_bytes_saved": 0, "starred": False,
+        "deleted_at": None, "ml_model_version": ml_version,
+        "folder_id": folder_id,
+    }
+    db_upsert_file(uid, entry)
+    db_upsert_chunks(uid, file_hash, chunks)
+    db_update_stats(uid, original_size, stored_size)
+    broadcast({"type": "file_available", "file_id": file_hash,
+               "filename": filename, "chunk_count": chunk_count})
+
+    return {
+        "status": "uploaded", "file_id": file_hash, "hash": file_hash,
+        "filename": filename, "category": category,
+        "original_size": original_size, "stored_size": stored_size,
+        "ratio": round(best_ratio, 3), "level": chosen_level,
+        "chunks": chunks, "chunk_count": chunk_count,
+        "savings": original_size - stored_size, "encrypted": True,
+        "ref_count": 1, "dedup_bytes_saved": 0, "starred": False,
+        "ml_model_version": ml_version,
+        "entropy": round(entropy if not pre_compressed else (client_entropy or 0), 3),
+        "pre_compressed": pre_compressed,
+        "folder_id": folder_id,
+    }
+
+# ══════════════════════════════════════════════════════════════════
+# FEATURE 2: Resumable upload session management
+# ══════════════════════════════════════════════════════════════════
+
+def _session_path(session_id): return os.path.join(UPLOAD_SESSIONS_DIR, session_id)
+
+def _load_session(session_id):
+    p = _session_path(session_id) + ".json"
+    if not os.path.exists(p): return None
+    with open(p) as f: return json.load(f)
+
+def _save_session(session_id, data):
+    with open(_session_path(session_id) + ".json", "w") as f:
+        json.dump(data, f)
+
+def _cleanup_session(session_id):
+    base = _session_path(session_id)
+    for ext in [".json"]:
+        p = base + ext
+        if os.path.exists(p): os.remove(p)
+    # Remove chunk temp files
+    import glob
+    for f in glob.glob(base + ".chunk_*"):
+        os.remove(f)
+
+def _expire_old_sessions():
+    """Remove sessions older than 24h — called periodically."""
+    cutoff = time.time() - 86400
+    for fname in os.listdir(UPLOAD_SESSIONS_DIR):
+        if fname.endswith(".json"):
+            fpath = os.path.join(UPLOAD_SESSIONS_DIR, fname)
+            try:
+                with open(fpath) as f: sess = json.load(f)
+                if sess.get("created_at", 0) < cutoff:
+                    sid = fname.replace(".json", "")
+                    _cleanup_session(sid)
+            except Exception: pass
+
+# ══════════════════════════════════════════════════════════════════
+# FEATURE 3: Public link helpers
+# ══════════════════════════════════════════════════════════════════
+
+def db_get_public_link(file_hash):
+    """Get existing public link for a file."""
+    res = sb.table("shared_files").select("*")\
+        .eq("share_token", file_hash)\
+        .eq("shared_with", "__public__")\
+        .limit(1).execute()
+    return res.data[0] if res.data else None
+
+def db_create_public_link(uid, file_hash, file_id, expires_days=None):
+    token      = secrets.token_urlsafe(32)
+    expires_at = None
+    if expires_days:
+        expires_at = (datetime.now(timezone.utc) +
+                      timedelta(days=int(expires_days))).isoformat()
+    # Use "__public__" sentinel for shared_with so unique constraint works cleanly.
+    # The /p/<token> download route and queries filter on this value.
+    row = {
+        "file_id":     file_id,
+        "owner_id":    uid,
+        "shared_with": "__public__",
+        "share_token": token,
+        "expires_at":  expires_at,
+    }
+    try:
+        sb.table("shared_files").insert(row).execute()
+    except Exception as e:
+        print(f"[public_link] insert failed: {e}")
+        raise
+    return token
+
+# ══════════════════════════════════════════════════════════════════
+# HTTP Routes
+# ══════════════════════════════════════════════════════════════════
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_react(path):
+    if not path or path == "/":
+        return jsonify({"status": "online", "version": "Phase 8+", "message": "Nexus API"}), 200
+    return jsonify({"error": f"Route /{path} not found"}), 404
 
 @app.route("/health")
 def health():
     return jsonify({
         "status": "ok", "peers": len(peers), "supabase": True,
-        "capabilities": ["folders","sharing","quota","admin","p2p","ml",
-                         "encryption","client_compression","resumable_upload","public_links"],
+        "capabilities": ["folders", "sharing", "quota", "admin", "p2p", "ml",
+                         "encryption", "client_compression", "resumable_upload",
+                         "public_links"],
     })
 
-# ── Feature 1: Upload (standard + pre-compressed) ─────────────────────────────
+# ── Feature 1: Regular upload (server OR client compression) ──────
 
 @app.route("/upload", methods=["POST"])
 @require_auth
@@ -519,14 +649,17 @@ def upload():
     file = request.files.get("file")
     if not file: return jsonify({"error": "No file"}), 400
 
-    filename       = file.filename
-    folder_id      = request.form.get("folder_id")
+    filename      = file.filename
+    folder_id     = request.form.get("folder_id")
     pre_compressed = request.headers.get("X-Pre-Compressed", "").lower() == "true"
-    client_orig    = request.headers.get("X-Original-Size")
+    client_orig   = request.headers.get("X-Original-Size")
     client_entropy = request.headers.get("X-Entropy")
-    original_data  = file.read()
-    check_size     = int(client_orig) if pre_compressed and client_orig else len(original_data)
-    uid            = g.uid
+
+    original_data = file.read()
+    # For quota check: use real original size
+    check_size = int(client_orig) if pre_compressed and client_orig else len(original_data)
+
+    uid = g.uid
 
     if not check_quota(uid, check_size):
         used, quota = get_quota(uid)
@@ -535,13 +668,14 @@ def upload():
                                    f"{(quota-used)//(1024**2)} MB remaining.",
                         "used_bytes": used, "quota_bytes": quota}), 413
 
+    # Duplicate filename check
     existing_name = db_get_file_by_name(uid, filename, folder_id)
     if existing_name:
         return jsonify({"error": "duplicate_filename",
                         "message": f'You already have "{filename}" in this folder.',
                         "existing_id": existing_name["hash"]}), 409
 
-    # Dedup check (server-compressed only — hash is of original bytes)
+    # Hash dedup — only for server-compressed (we have original bytes)
     if not pre_compressed:
         file_hash = hashlib.sha256(original_data).hexdigest()
         existing  = db_get_file(uid, file_hash)
@@ -551,13 +685,15 @@ def upload():
             sb.table("files").update({"ref_count": new_ref, "dedup_bytes_saved": new_dedup})\
                 .eq("user_id", uid).eq("hash", file_hash).execute()
             db_update_stats(uid, 0, 0, is_dedup=True, dedup_saved=existing["stored_size"])
-            return jsonify({"status": "deduplicated", "file_id": file_hash, "hash": file_hash,
-                            "filename": existing["filename"], "original_size": check_size,
-                            "stored_size": existing["stored_size"], "ratio": existing["ratio"],
-                            "category": file_category(filename),
+            return jsonify({"status": "deduplicated", "file_id": file_hash,
+                            "hash": file_hash, "filename": existing["filename"],
+                            "original_size": check_size,
+                            "stored_size": existing["stored_size"],
+                            "ratio": existing["ratio"], "category": file_category(filename),
                             "chunk_count": existing["chunk_count"],
                             "savings": check_size - existing["stored_size"],
-                            "ref_count": new_ref, "dedup_bytes_saved": new_dedup, "encrypted": True})
+                            "ref_count": new_ref, "dedup_bytes_saved": new_dedup,
+                            "encrypted": True})
 
     result = _process_and_store(
         uid, filename, original_data, folder_id,
@@ -567,11 +703,17 @@ def upload():
     )
     return jsonify(result)
 
-# ── Feature 2: Resumable upload endpoints ─────────────────────────────────────
+# ── Feature 2: Resumable upload endpoints ─────────────────────────
 
 @app.route("/upload/init", methods=["POST"])
 @require_auth
 def upload_init():
+    """
+    Start a resumable upload session.
+    Body: { filename, total_size, total_chunks, folder_id?, pre_compressed? }
+    Returns: { session_id, chunk_size }
+    """
+    _expire_old_sessions()
     body          = request.get_json(silent=True) or {}
     filename      = (body.get("filename") or "").strip()
     total_size    = body.get("total_size", 0)
@@ -583,6 +725,7 @@ def upload_init():
         return jsonify({"error": "filename, total_size, total_chunks required"}), 400
 
     uid = g.uid
+
     if not check_quota(uid, total_size):
         used, quota = get_quota(uid)
         return jsonify({"error": "quota_exceeded",
@@ -597,10 +740,15 @@ def upload_init():
 
     session_id = secrets.token_urlsafe(24)
     session = {
-        "session_id": session_id, "uid": uid, "filename": filename,
-        "total_size": total_size, "total_chunks": total_chunks,
-        "folder_id": folder_id, "pre_compressed": pre_compressed,
-        "received": [], "created_at": time.time(),
+        "session_id":     session_id,
+        "uid":            uid,
+        "filename":       filename,
+        "total_size":     total_size,
+        "total_chunks":   total_chunks,
+        "folder_id":      folder_id,
+        "pre_compressed": pre_compressed,
+        "received":       [],    # list of received chunk indices
+        "created_at":     time.time(),
     }
     _save_session(session_id, session)
     return jsonify({"session_id": session_id, "chunk_size": CHUNK_SIZE})
@@ -609,21 +757,32 @@ def upload_init():
 @app.route("/upload/chunk", methods=["POST"])
 @require_auth
 def upload_chunk():
+    """
+    Upload a single chunk of a resumable session.
+    Form fields: session_id, chunk_index
+    File field:  chunk (binary data)
+    Returns: { received: [indices...], done: bool }
+    """
     session_id  = request.form.get("session_id")
     chunk_index = request.form.get("chunk_index")
     chunk_file  = request.files.get("chunk")
+
     if not session_id or chunk_index is None or not chunk_file:
         return jsonify({"error": "session_id, chunk_index, chunk required"}), 400
 
     chunk_index = int(chunk_index)
     session     = _load_session(session_id)
-    if not session: return jsonify({"error": "Session not found or expired"}), 404
-    if session["uid"] != g.uid: return jsonify({"error": "Unauthorized"}), 401
+    if not session:
+        return jsonify({"error": "Session not found or expired"}), 404
+    if session["uid"] != g.uid:
+        return jsonify({"error": "Unauthorized"}), 401
 
+    # Save chunk to temp file
     chunk_data = chunk_file.read()
-    with open(_session_path(session_id) + f".chunk_{chunk_index}", "wb") as f:
-        f.write(chunk_data)
+    chunk_temp = _session_path(session_id) + f".chunk_{chunk_index}"
+    with open(chunk_temp, "wb") as f: f.write(chunk_data)
 
+    # Update received list
     if chunk_index not in session["received"]:
         session["received"].append(chunk_index)
     _save_session(session_id, session)
@@ -636,26 +795,38 @@ def upload_chunk():
 @app.route("/upload/finish", methods=["POST"])
 @require_auth
 def upload_finish():
+    """
+    Assemble all chunks and complete the upload.
+    Body: { session_id, entropy? }
+    Returns: same as /upload
+    """
     body       = request.get_json(silent=True) or {}
     session_id = body.get("session_id")
     entropy    = body.get("entropy")
-    if not session_id: return jsonify({"error": "session_id required"}), 400
+
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
 
     session = _load_session(session_id)
-    if not session: return jsonify({"error": "Session not found or expired"}), 404
-    if session["uid"] != g.uid: return jsonify({"error": "Unauthorized"}), 401
+    if not session:
+        return jsonify({"error": "Session not found or expired"}), 404
+    if session["uid"] != g.uid:
+        return jsonify({"error": "Unauthorized"}), 401
 
     total_chunks = session["total_chunks"]
-    if len(session["received"]) < total_chunks:
-        missing = [i for i in range(total_chunks) if i not in session["received"]]
+    received     = session["received"]
+    if len(received) < total_chunks:
+        missing = [i for i in range(total_chunks) if i not in received]
         return jsonify({"error": "Missing chunks", "missing": missing}), 400
 
+    # Reassemble in order
     parts = []
     for i in range(total_chunks):
-        with open(_session_path(session_id) + f".chunk_{i}", "rb") as f:
-            parts.append(f.read())
+        chunk_temp = _session_path(session_id) + f".chunk_{i}"
+        with open(chunk_temp, "rb") as f: parts.append(f.read())
     full_data = b"".join(parts)
 
+    # Process and store
     result = _process_and_store(
         session["uid"], session["filename"], full_data,
         folder_id=session.get("folder_id"),
@@ -670,59 +841,46 @@ def upload_finish():
 @app.route("/upload/status/<session_id>", methods=["GET"])
 @require_auth
 def upload_status(session_id):
+    """Check which chunks have been received for a session."""
     session = _load_session(session_id)
     if not session: return jsonify({"error": "Not found"}), 404
     if session["uid"] != g.uid: return jsonify({"error": "Unauthorized"}), 401
     return jsonify({"received": session["received"], "total": session["total_chunks"]})
 
-# ── Feature 3: Public share links ─────────────────────────────────────────────
+# ── Feature 3: Public share links ─────────────────────────────────
 
 @app.route("/share/<file_hash>/public", methods=["POST"])
 @require_auth
 def create_public_link(file_hash):
-    body         = request.get_json(silent=True) or {}
+    """Create a public link for a file — anyone with the token can download."""
+    body        = request.get_json(silent=True) or {}
     expires_days = body.get("expires_days")
-    file_row     = db_get_file(g.uid, file_hash)
+    file_row    = db_get_file(g.uid, file_hash)
     if not file_row: return jsonify({"error": "File not found"}), 404
 
-    # Check if public link already exists (shared_with IS NULL = public)
-    existing = sb.table("shared_files").select("share_token,expires_at")\
+    # Check if public link already exists for this file
+    existing = sb.table("shared_files").select("share_token, expires_at")\
         .eq("file_id", file_row["id"]).eq("owner_id", g.uid)\
-        .is_("shared_with", "null").limit(1).execute()
+        .eq("shared_with", "__public__").limit(1).execute()
     if existing.data:
-        token = existing.data[0]["share_token"]
-        return jsonify({
-            "status": "exists", "token": token,
-            "public_url": f"{request.host_url}p/{token}",
-            "expires_at": existing.data[0]["expires_at"],
-        }), 200
+        return jsonify({"status": "exists", "token": existing.data[0]["share_token"],
+                        "expires_at": existing.data[0]["expires_at"]}), 200
 
-    token      = secrets.token_urlsafe(32)
-    expires_at = None
-    if expires_days:
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=int(expires_days))).isoformat()
-
-    sb.table("shared_files").insert({
-        "file_id": file_row["id"], "owner_id": g.uid,
-        "shared_with": None,   # NULL = public link
-        "share_token": token, "expires_at": expires_at,
-    }).execute()
-
-    return jsonify({
-        "status": "created", "token": token,
-        "public_url": f"{request.host_url}p/{token}",
-        "expires_at": expires_at,
-    }), 201
+    token = db_create_public_link(g.uid, file_hash, file_row["id"], expires_days)
+    public_url = f"{request.host_url}p/{token}"
+    return jsonify({"status": "created", "token": token,
+                    "public_url": public_url}), 201
 
 
 @app.route("/share/<file_hash>/public", methods=["GET"])
 @require_auth
 def get_public_link(file_hash):
+    """Get existing public link info for a file."""
     file_row = db_get_file(g.uid, file_hash)
-    if not file_row: return jsonify({"error": "Not found"}), 404
-    existing = sb.table("shared_files").select("share_token,expires_at,created_at")\
+    if not file_row: return jsonify({"error": "File not found"}), 404
+    existing = sb.table("shared_files").select("share_token, expires_at, created_at")\
         .eq("file_id", file_row["id"]).eq("owner_id", g.uid)\
-        .is_("shared_with", "null").limit(1).execute()
+        .eq("shared_with", "__public__").limit(1).execute()
     if not existing.data:
         return jsonify({"exists": False}), 200
     d = existing.data[0]
@@ -734,21 +892,22 @@ def get_public_link(file_hash):
 @app.route("/share/<file_hash>/public", methods=["DELETE"])
 @require_auth
 def revoke_public_link(file_hash):
+    """Revoke a file's public link."""
     file_row = db_get_file(g.uid, file_hash)
-    if not file_row: return jsonify({"error": "Not found"}), 404
+    if not file_row: return jsonify({"error": "File not found"}), 404
     sb.table("shared_files").delete()\
         .eq("file_id", file_row["id"]).eq("owner_id", g.uid)\
-        .is_("shared_with", "null").execute()
+        .eq("shared_with", "__public__").execute()
     return jsonify({"status": "revoked"})
 
 
 @app.route("/p/<token>/info", methods=["GET"])
 def public_link_info(token):
-    """File info for a public link — no auth required."""
+    """Return file info for a public link — no auth needed."""
     res = sb.table("shared_files").select(
-        "owner_id,expires_at,created_at,"
-        "files(hash,filename,category,original_size,stored_size,chunk_count,ratio)"
-    ).eq("share_token", token).is_("shared_with", "null").limit(1).execute()
+        "owner_id, expires_at, created_at, "
+        "files(hash, filename, category, original_size, stored_size, chunk_count, ratio)"
+    ).eq("share_token", token).eq("shared_with", "__public__").limit(1).execute()
 
     if not res.data: return jsonify({"error": "Invalid or expired link"}), 404
     share = res.data[0]
@@ -760,25 +919,29 @@ def public_link_info(token):
                 return jsonify({"error": "This link has expired"}), 410
         except Exception: pass
 
-    fi  = share.get("files", {})
+    fi = share.get("files", {})
     pct = 0
     if fi.get("original_size") and fi.get("stored_size"):
-        pct = round((1 - fi["stored_size"] / fi["original_size"]) * 100, 1)
+        pct = round((1 - fi["stored_size"]/fi["original_size"])*100, 1)
 
     return jsonify({
-        "filename": fi.get("filename"), "category": fi.get("category"),
-        "original_size": fi.get("original_size"), "stored_size": fi.get("stored_size"),
-        "ratio": fi.get("ratio"), "savings_pct": pct,
-        "created_at": share.get("created_at"), "expires_at": share.get("expires_at"),
+        "filename":      fi.get("filename"),
+        "category":      fi.get("category"),
+        "original_size": fi.get("original_size"),
+        "stored_size":   fi.get("stored_size"),
+        "ratio":         fi.get("ratio"),
+        "savings_pct":   pct,
+        "created_at":    share.get("created_at"),
+        "expires_at":    share.get("expires_at"),
     })
 
 
 @app.route("/p/<token>", methods=["GET"])
 def public_download(token):
-    """Download via public link — no auth required."""
+    """Download a file via public link — no auth needed."""
     res = sb.table("shared_files").select(
-        "owner_id,expires_at,files(hash,filename,chunk_count)"
-    ).eq("share_token", token).is_("shared_with", "null").limit(1).execute()
+        "owner_id, expires_at, files(hash, filename, chunk_count)"
+    ).eq("share_token", token).eq("shared_with", "__public__").limit(1).execute()
 
     if not res.data: return jsonify({"error": "Invalid or expired link"}), 404
     share = res.data[0]
@@ -793,16 +956,18 @@ def public_download(token):
     fi        = share.get("files", {})
     uid       = share["owner_id"]
     file_hash = fi.get("hash")
+
     if not file_hash: return jsonify({"error": "File not found"}), 404
 
     try:
         blob     = storage_download(BLOB_BUCKET, blob_path(uid, file_hash))
         original = zstd.ZstdDecompressor().decompress(decrypt(blob, file_hash))
-        return send_file(io.BytesIO(original), download_name=fi.get("filename"), as_attachment=True)
+        return send_file(io.BytesIO(original), download_name=fi.get("filename"),
+                         as_attachment=True)
     except Exception as e:
         return jsonify({"error": f"Download failed: {e}"}), 500
 
-# ── Private sharing ───────────────────────────────────────────────────────────
+# ── Private sharing (unchanged from Phase 8) ──────────────────────
 
 @app.route("/share/<file_hash>", methods=["POST"])
 @require_auth
@@ -811,22 +976,26 @@ def share_file(file_hash):
     recipient  = (body.get("email") or "").strip().lower()
     expires_in = body.get("expires_days")
     if not recipient: return jsonify({"error": "email required"}), 400
-    if recipient == g.email.lower(): return jsonify({"error": "Cannot share with yourself"}), 400
+    if recipient == g.email.lower():
+        return jsonify({"error": "Cannot share with yourself"}), 400
     file_row = db_get_file(g.uid, file_hash)
     if not file_row: return jsonify({"error": "File not found"}), 404
     existing = sb.table("shared_files").select("id,share_token")\
         .eq("file_id", file_row["id"]).eq("shared_with", recipient).limit(1).execute()
     if existing.data:
-        return jsonify({"status": "already_shared", "share_token": existing.data[0]["share_token"]}), 200
+        return jsonify({"status": "already_shared",
+                        "share_token": existing.data[0]["share_token"]}), 200
     token      = secrets.token_urlsafe(32)
     expires_at = None
     if expires_in:
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=int(expires_in))).isoformat()
+        expires_at = (datetime.now(timezone.utc) +
+                      timedelta(days=int(expires_in))).isoformat()
     sb.table("shared_files").insert({
         "file_id": file_row["id"], "owner_id": g.uid,
         "shared_with": recipient, "share_token": token, "expires_at": expires_at,
     }).execute()
-    return jsonify({"status": "shared", "share_token": token, "shared_with": recipient}), 201
+    return jsonify({"status": "shared", "share_token": token,
+                    "shared_with": recipient}), 201
 
 @app.route("/share/<file_hash>", methods=["GET"])
 @require_auth
@@ -835,7 +1004,7 @@ def list_shares(file_hash):
     if not file_row: return jsonify({"error": "Not found"}), 404
     res = sb.table("shared_files").select("shared_with,share_token,created_at,expires_at")\
         .eq("file_id", file_row["id"]).eq("owner_id", g.uid)\
-        .not_.is_("shared_with", "null").execute()
+        .neq("shared_with", "__public__").execute()
     return jsonify(res.data or [])
 
 @app.route("/share/<file_hash>/revoke", methods=["DELETE"])
@@ -846,7 +1015,8 @@ def revoke_share(file_hash):
     file_row = db_get_file(g.uid, file_hash)
     if not file_row: return jsonify({"error": "Not found"}), 404
     sb.table("shared_files").delete()\
-        .eq("file_id", file_row["id"]).eq("owner_id", g.uid).eq("shared_with", email).execute()
+        .eq("file_id", file_row["id"]).eq("owner_id", g.uid)\
+        .eq("shared_with", email).execute()
     return jsonify({"status": "revoked"})
 
 @app.route("/shared-with-me", methods=["GET"])
@@ -866,7 +1036,7 @@ def shared_with_me():
         out.append(row)
     return jsonify(out)
 
-# ── Folders ───────────────────────────────────────────────────────────────────
+# ── Folders (unchanged) ───────────────────────────────────────────
 
 @app.route("/folders", methods=["GET"])
 @require_auth
@@ -879,13 +1049,15 @@ def list_folders():
 @app.route("/folders", methods=["POST"])
 @require_auth
 def create_folder():
-    body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip(); parent_id = body.get("parent_id")
+    body      = request.get_json(silent=True) or {}
+    name      = (body.get("name") or "").strip()
+    parent_id = body.get("parent_id")
     if not name: return jsonify({"error": "name required"}), 400
     q = sb.table("folders").select("id").eq("user_id", g.uid).eq("name", name)
     q = q.eq("parent_id", parent_id) if parent_id else q.is_("parent_id", "null")
     if q.execute().data: return jsonify({"error": f'Folder "{name}" already exists'}), 409
-    res = sb.table("folders").insert({"user_id": g.uid, "name": name, "parent_id": parent_id}).execute()
+    res = sb.table("folders").insert({"user_id": g.uid, "name": name,
+                                      "parent_id": parent_id}).execute()
     return jsonify(res.data[0]), 201
 
 @app.route("/folders/<folder_id>", methods=["PATCH"])
@@ -894,22 +1066,26 @@ def rename_folder(folder_id):
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
     if not name: return jsonify({"error": "name required"}), 400
-    sb.table("folders").update({"name": name}).eq("id", folder_id).eq("user_id", g.uid).execute()
+    sb.table("folders").update({"name": name})\
+        .eq("id", folder_id).eq("user_id", g.uid).execute()
     return jsonify({"status": "renamed"})
 
 @app.route("/folders/<folder_id>", methods=["DELETE"])
 @require_auth
 def delete_folder(folder_id):
-    sb.table("files").update({"folder_id": None}).eq("folder_id", folder_id).eq("user_id", g.uid).execute()
-    sb.table("folders").update({"parent_id": None}).eq("parent_id", folder_id).eq("user_id", g.uid).execute()
+    sb.table("files").update({"folder_id": None})\
+        .eq("folder_id", folder_id).eq("user_id", g.uid).execute()
+    sb.table("folders").update({"parent_id": None})\
+        .eq("parent_id", folder_id).eq("user_id", g.uid).execute()
     sb.table("folders").delete().eq("id", folder_id).eq("user_id", g.uid).execute()
     return jsonify({"status": "deleted"})
 
 @app.route("/files/<file_hash>/move", methods=["PATCH"])
 @require_auth
 def move_file(file_hash):
-    body = request.get_json(silent=True) or {}
-    sb.table("files").update({"folder_id": body.get("folder_id")})\
+    body      = request.get_json(silent=True) or {}
+    folder_id = body.get("folder_id")
+    sb.table("files").update({"folder_id": folder_id})\
         .eq("hash", file_hash).eq("user_id", g.uid).execute()
     return jsonify({"status": "moved"})
 
@@ -922,18 +1098,21 @@ def folder_breadcrumb(folder_id):
         res = sb.table("folders").select("id,name,parent_id")\
             .eq("id", current_id).eq("user_id", g.uid).limit(1).execute()
         if not res.data: break
-        f = res.data[0]; crumbs.insert(0, {"id": f["id"], "name": f["name"]}); current_id = f.get("parent_id")
+        f = res.data[0]
+        crumbs.insert(0, {"id": f["id"], "name": f["name"]})
+        current_id = f.get("parent_id")
     crumbs.insert(0, {"id": None, "name": "My Files"})
     return jsonify(crumbs)
 
-# ── Files CRUD ────────────────────────────────────────────────────────────────
+# ── Files CRUD (unchanged) ────────────────────────────────────────
 
 @app.route("/files", methods=["GET"])
 @require_auth
 def list_files():
-    view = request.args.get("view", "active"); folder_id = request.args.get("folder_id")
-    files = db_list_files(g.uid, view, folder_id if view == "active" else None)
-    cutoff = time.time() - TRASH_DAYS * 86400; to_purge = []
+    view      = request.args.get("view", "active")
+    folder_id = request.args.get("folder_id")
+    files     = db_list_files(g.uid, view, folder_id if view == "active" else None)
+    cutoff    = time.time() - TRASH_DAYS * 86400; to_purge = []
     for f in files:
         if view == "trash" and f.get("deleted_at"):
             try:
@@ -957,7 +1136,8 @@ def toggle_star(file_id):
     row = db_get_file(g.uid, file_id)
     if not row: return jsonify({"error": "Not found"}), 404
     new_val = not row.get("starred", False)
-    sb.table("files").update({"starred": new_val}).eq("user_id", g.uid).eq("hash", file_id).execute()
+    sb.table("files").update({"starred": new_val})\
+        .eq("user_id", g.uid).eq("hash", file_id).execute()
     return jsonify({"starred": new_val})
 
 @app.route("/trash/<file_id>", methods=["PATCH"])
@@ -965,8 +1145,9 @@ def toggle_star(file_id):
 def move_to_trash(file_id):
     row = db_get_file(g.uid, file_id)
     if not row: return jsonify({"error": "Not found"}), 404
-    sb.table("files").update({"deleted_at": datetime.now(timezone.utc).isoformat(), "starred": False})\
-        .eq("user_id", g.uid).eq("hash", file_id).execute()
+    sb.table("files").update({
+        "deleted_at": datetime.now(timezone.utc).isoformat(), "starred": False
+    }).eq("user_id", g.uid).eq("hash", file_id).execute()
     return jsonify({"status": "trashed"})
 
 @app.route("/restore/<file_id>", methods=["PATCH"])
@@ -974,7 +1155,8 @@ def move_to_trash(file_id):
 def restore_from_trash(file_id):
     row = db_get_file(g.uid, file_id)
     if not row: return jsonify({"error": "Not found"}), 404
-    sb.table("files").update({"deleted_at": None}).eq("user_id", g.uid).eq("hash", file_id).execute()
+    sb.table("files").update({"deleted_at": None})\
+        .eq("user_id", g.uid).eq("hash", file_id).execute()
     return jsonify({"status": "restored"})
 
 @app.route("/delete/<file_id>", methods=["DELETE"])
@@ -1010,17 +1192,20 @@ def quota():
 @app.route("/stats", methods=["GET"])
 @require_auth
 def stats():
-    s = db_get_user_stats(g.uid)
+    s    = db_get_user_stats(g.uid)
     used = s.get("total_stored", 0); quota = s.get("quota_bytes", QUOTA_BYTES)
     return jsonify({
-        "total_files": s.get("total_files", 0), "total_original": s.get("total_original", 0),
-        "total_stored": used, "space_saved": s.get("total_original", 0) - used,
-        "overall_ratio": round(s["total_original"]/used, 3) if used else 1,
+        "total_files":        s.get("total_files", 0),
+        "total_original":     s.get("total_original", 0),
+        "total_stored":       used,
+        "space_saved":        s.get("total_original", 0) - used,
+        "overall_ratio":      round(s["total_original"]/used, 3) if used else 1,
         "total_dedup_events": s.get("total_dedup_events", 0),
-        "total_dedup_saved": s.get("total_dedup_saved", 0),
-        "live_peers": len(peers),
-        "ml_models_trained": sum(1 for v in _ml_version.values() if v > 0),
-        "quota_bytes": quota, "quota_used_pct": round(used/quota*100, 2) if quota else 0,
+        "total_dedup_saved":  s.get("total_dedup_saved", 0),
+        "live_peers":         len(peers),
+        "ml_models_trained":  sum(1 for v in _ml_version.values() if v > 0),
+        "quota_bytes":        quota,
+        "quota_used_pct":     round(used/quota*100, 2) if quota else 0,
     })
 
 @app.route("/ml_status", methods=["GET"])
@@ -1032,7 +1217,7 @@ def ml_status():
                               "fitted": _ml_models.get(cat) is not None}
                         for cat in CATEGORIES})
 
-# ── Admin ─────────────────────────────────────────────────────────────────────
+# ── Admin ─────────────────────────────────────────────────────────
 
 @app.route("/admin/stats", methods=["GET"])
 @require_admin
@@ -1040,15 +1225,15 @@ def admin_stats():
     try:
         data = (sb.table("user_stats").select("*").execute()).data or []
         return jsonify({
-            "total_users": len(data),
-            "total_files": sum(u.get("total_files", 0) for u in data),
+            "total_users":        len(data),
+            "total_files":        sum(u.get("total_files", 0) for u in data),
             "total_stored_bytes": sum(u.get("total_stored", 0) for u in data),
-            "total_orig_bytes": sum(u.get("total_original", 0) for u in data),
-            "total_quota_bytes": sum(u.get("quota_bytes", QUOTA_BYTES) for u in data),
-            "platform_saved": sum(u.get("total_original", 0)-u.get("total_stored", 0) for u in data),
+            "total_orig_bytes":   sum(u.get("total_original", 0) for u in data),
+            "total_quota_bytes":  sum(u.get("quota_bytes", QUOTA_BYTES) for u in data),
+            "platform_saved":     sum(u.get("total_original",0)-u.get("total_stored",0) for u in data),
             "total_dedup_events": sum(u.get("total_dedup_events", 0) for u in data),
-            "live_peers": len(peers), "peers": peer_summary(),
-            "ml_models_trained": sum(1 for v in _ml_version.values() if v > 0),
+            "live_peers":         len(peers), "peers": peer_summary(),
+            "ml_models_trained":  sum(1 for v in _ml_version.values() if v > 0),
         })
     except Exception as e: return jsonify({"error": str(e)}), 500
 
@@ -1067,38 +1252,7 @@ def admin_peers():
 def list_peers():
     return jsonify({"count": len(peers), "peers": peer_summary()})
 
-# ── React build serving — MUST be last ───────────────────────────────────────
-# This catch-all serves index.html for any path not matched above.
-# It explicitly returns 404 JSON for paths that look like API calls
-# so you never get HTML back when expecting JSON.
-
-API_PREFIXES = (
-    "/upload", "/files", "/folders", "/share", "/shared",
-    "/p/", "/star/", "/trash/", "/restore/", "/delete/",
-    "/download/", "/quota", "/stats", "/ml_status",
-    "/admin/", "/peers", "/health", "/ws",
-)
-
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def serve_react(path):
-    # If the path looks like an API call, return 404 JSON instead of HTML.
-    # This prevents "SyntaxError: Unexpected token '<'" in the browser console.
-    full_path = "/" + path
-    if any(full_path.startswith(prefix) for prefix in API_PREFIXES):
-        return jsonify({"error": f"Route {full_path} not found"}), 404
-
-    dist = os.path.join(os.path.dirname(__file__), "dist")
-    if not os.path.exists(dist):
-        return jsonify({"status": "online", "version": "Phase 9",
-                        "message": "Nexus API — run npm run build for frontend"}), 200
-
-    full = os.path.join(dist, path)
-    if path and os.path.exists(full):
-        return send_from_directory(dist, path)
-    return send_from_directory(dist, "index.html")
-
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

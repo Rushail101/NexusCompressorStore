@@ -118,7 +118,7 @@ function NewFolderModal({ token, parentId, onCreated, onClose }) {
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.8)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={onClose}>
       <div onClick={e=>e.stopPropagation()} style={{background:"#161616",padding:"1.5rem",borderRadius:16,border:"1px solid rgba(255,255,255,0.1)",width:380}}>
         <h3 style={{margin:"0 0 16px",fontSize:14,color:"#fff",fontFamily:"monospace"}}>📁 ALLOCATE_NEW_DIRECTORY</h3>
-        <input autoFocus value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&executeCreate()} placeholder="Directory handle identifier..." style={{width:"100%",padding:11,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",color:"#fff",borderRadius:10,fontSize:13,outline:"none",boxSizing:"border-box",marginBottom:14}}/>
+        <input autoFocus value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&executeCreate()} placeholder="Directory name..." style={{width:"100%",padding:11,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",color:"#fff",borderRadius:10,fontSize:13,outline:"none",boxSizing:"border-box",marginBottom:14}}/>
         <div style={{display:"flex",gap:8}}>
           <button onClick={onClose} style={{flex:1,padding:9,borderRadius:8,background:"transparent",border:"1px solid rgba(255,255,255,0.1)",color:"rgba(255,255,255,0.6)",cursor:"pointer"}}>Cancel</button>
           <button onClick={executeCreate} style={{flex:1,padding:9,borderRadius:8,background:"#3B82F6",border:"none",color:"#fff",cursor:"pointer",fontWeight:500}}>Build Matrix Link</button>
@@ -149,7 +149,7 @@ function AuthPage({ onAuth }) {
   );
 }
 
-// ── Shared Distribution Router Components ─────────────────────────
+// ── Share Panel ───────────────────────────────────────────────────
 
 function ShareModal({ file, token, onClose }) {
   const [email, setEmail] = useState(""); const [shares, setShares] = useState([]); const [publicLink, setPublicLink] = useState(null); const [copied, setCopied] = useState(false); const [success, setSuccess] = useState(""); const ap = useMemo(() => apiFetch(token), [token]);
@@ -164,40 +164,33 @@ function ShareModal({ file, token, onClose }) {
     if(res.ok) { setSuccess(`Channel access authorized for ${email}`); setEmail(""); loadData(); }
   };
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.8)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}} onClick={onClose}>
-      <div onClick={e=>e.stopPropagation()} style={{background:"#161616",borderRadius:16,padding:"1.5rem",width:480,border:"1px solid rgba(255,255,255,0.1)",boxShadow:"0 24px 60px rgba(0,0,0,0.7)"}}>
-        <h3 style={{margin:0,fontSize:15,fontWeight:500,color:"#fff"}}>🔗 Share file</h3>
-        <p style={{fontSize:12,color:"rgba(255,255,255,0.4)",margin:"4px 0 16px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{file.filename}</p>
-        
-        <div style={{background:"rgba(255,255,255,0.03)",padding:14,borderRadius:10,marginBottom:16,border:"0.5px solid rgba(255,255,255,0.07)"}}>
-          <p style={{margin:"0 0 6px",fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase"}}>Public link</p>
-          {publicLink ? (
-            <div style={{display:"flex",gap:8}}>
-              <input readOnly value={publicLink} style={{flex:1,padding:9,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",color:"rgba(255,255,255,0.6)",borderRadius:8,fontSize:11,outline:"none"}}/>
-              <button onClick={()=>{navigator.clipboard.writeText(publicLink);setCopied(true);}} style={{background:"rgba(59,130,246,0.12)",border:"0.5px solid rgba(59,130,246,0.3)",color:"#60A5FA",padding:"0 14px",borderRadius:8,cursor:"pointer",fontSize:12}}>{copied?"✓":"Copy"}</button>
-            </div>
-          ) : <button onClick={async()=>{ const r=await ap(`/share/${file.hash}/public`,{method:"POST"}); const d=await r.json(); setPublicLink(d.public_url); }} style={{width:"100%",padding:9,background:"rgba(59,130,246,0.12)",border:"0.5px solid rgba(59,130,246,0.3)",color:"#60A5FA",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:500}}>Create public link</button>}
-        </div>
-
-        <div style={{background:"rgba(255,255,255,0.03)",padding:14,borderRadius:10,border:"0.5px solid rgba(255,255,255,0.07)"}}>
-          <p style={{margin:"0 0 6px",fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase"}}>Share with user</p>
-          <div style={{display:"flex",gap:8}}>
-            <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="Recipient email address..." style={{flex:1,padding:9,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",color:"#fff",borderRadius:8,fontSize:13,outline:"none"}}/>
-            <button onClick={handleShare} style={{background:"#3B82F6",color:"#fff",border:"none",borderRadius:8,padding:"0 14px",cursor:"pointer",fontSize:12,fontWeight:500}}>Share</button>
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#111",borderRadius:14,padding:"1.5rem",width:460,border:"1px solid #222",fontFamily:"monospace"}}>
+        <p style={{margin:0,color:"#fff",fontSize:13}}>🔗 COURIER_ROUTING_CHANNEL_PROVISIONER</p>
+        <div style={{background:"rgba(255,255,255,0.01)",padding:12,borderRadius:8,margin:"12px 0",border:"1px solid #1a1a1a"}}>
+          <div style={{display:"flex",gap:6}}>
+            <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="Target node email..." style={{flex:1,padding:8,background:"#141414",border:"1px solid #222",color:"#fff",borderRadius:6,fontSize:12}}/>
+            <button onClick={handleShare} style={{background:"#3B82F6",color:"#fff",border:"none",borderRadius:6,padding:"0 12px",cursor:"pointer"}}>Authorize</button>
           </div>
           {success && <p style={{color:"#10B981",fontSize:11,margin:"6px 0 0"}}>{success}</p>}
         </div>
-
+        {publicLink ? (
+          <div style={{display:"flex",gap:6}}>
+            <input readOnly value={publicLink} style={{flex:1,padding:8,background:"#141414",border:"1px solid #222",color:"#666",borderRadius:6,fontSize:11}}/>
+            <button onClick={()=>{navigator.clipboard.writeText(publicLink);setCopied(true);}} style={{background:"#222",color:"#fff",border:"1px solid #333",padding:"0 12px",borderRadius:6}}>{copied?"✓":"Copy"}</button>
+          </div>
+        ) : <button onClick={async()=>{ const r=await ap(`/share/${file.hash}/public`,{method:"POST"}); const d=await r.json(); setPublicLink(d.public_url); }} style={{width:"100%",padding:10,background:"#161616",border:"1px solid #222",color:"#10B981",borderRadius:6,cursor:"pointer"}}>Build Anonymous Gateway Access Link</button>}
         {shares.length > 0 && (
-          <div style={{marginTop:16,maxHeight:120,overflowY:"auto"}}>
-            <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",margin:"0 0 6px"}}>Shared with</p>
-            {shares.map(s=><div key={s.shared_with} style={{fontSize:12,color:"#fff",padding:"4px 0",display:"flex",justify_content:"space-between"}}><span>{s.shared_with}</span><span style={{color:"rgba(255,255,255,0.3)",fontSize:11}}>{relTime(s.created_at)}</span></div>)}
+          <div style={{marginTop:12,maxHeight:100,overflowY:"auto"}}>
+            {shares.map(s=><div key={s.shared_with} style={{fontSize:11,color:"#aaa",padding:"3px 0"}}>• {s.shared_with} <span style={{color:"#333"}}>({relTime(s.created_at)})</span></div>)}
           </div>
         )}
       </div>
     </div>
   );
 }
+
+// ── Sprint 2 Activity Logs Audit Panel (FIXED Artifacts) ───────────
 
 function ActivityLogPanel({ token }) {
   const [logs, setLogs] = useState([]);
@@ -210,7 +203,8 @@ function ActivityLogPanel({ token }) {
       <div style={{maxHeight:120,overflowY:"auto",display:"flex",flexDirection:"column",gap:4}}>
         {logs.map(l => (
           <div key={l.id} style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"rgba(255,255,255,0.6)",borderBottom:"0.5px solid rgba(255,255,255,0.05)",paddingBottom:3}}>
-            <span style={{color:l.action_type Freemium-Tier==="UPLOAD"?"#10B981":l.action_type==="DELETE"?"#EF4444":"#3B82F6"}}>[{l.action_type}] {l.metadata?.filename || l.metadata?.destination}</span>
+            {/* FIXED: Removed leftover string chunk syntax artifact */}
+            <span style={{color: l.action_type === "UPLOAD" ? "#10B981" : l.action_type === "DELETE" ? "#EF4444" : "#3B82F6"}}>[{l.action_type}] {l.metadata?.filename || l.metadata?.destination}</span>
             <span style={{color:"rgba(255,255,255,0.2)"}}>{relTime(l.created_at)}</span>
           </div>
         ))}
@@ -219,7 +213,7 @@ function ActivityLogPanel({ token }) {
   );
 }
 
-// ── Marketplace Settings Dials ────────────────────────────────────
+// ── Marketplace Settings Panel (FIXED Artifacts) ───────────────────
 
 function MarketplaceSettings({ token, stats, refreshStats }) {
   const [plan, setPlan] = useState("Option_A_Eco"); const [allocatedGb, setAllocatedGb] = useState(20);
@@ -231,8 +225,9 @@ function MarketplaceSettings({ token, stats, refreshStats }) {
   return (
     <div style={{background:"rgba(255,255,255,0.03)",border:"0.5px solid rgba(255,255,255,0.06)",borderRadius:12,padding:12,marginTop:10}}>
       <div style={{display:"flex",gap:6}}>
-        <button onClick={()=>{setPlan("Option_A_Eco");syncAllocation("Option_A_Eco",0);}} style={{flex:1,padding:"6px 4px",fontSize:11,background:plan==="Option_A_Eco"?"rgba(16,185,129,0.15)":"transparent",color:plan==="Option_A_Eco"?"#34D399":"rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:6,cursor:"pointer"}}>🌱 Eco Mode</button>
-        <button onClick={()=>{setPlan("Option_B_Pro");syncAllocation("Option_B_Pro",allocatedGb);}} style={{flex:1,padding:"6px 4px",fontSize:11,background:plan==="Option_B_Pro"?"rgba(139,92,246,0.15)":"transparent",color:plan==="Option_B_Pro"?"#A78BFA":"rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:6,cursor:"pointer"}}>⚒️ Pro Miner</button>
+        {/* FIXED: Cleaned raw syntax constraint mismatch triggers */}
+        <button onClick={()=>{setPlan("Option_A_Eco");syncAllocation("Option_A_Eco",0);}} style={{flex:1,padding:"6px 4px",fontSize:11,background:plan === "Option_A_Eco" ? "rgba(16,185,129,0.15)" : "transparent",color:plan === "Option_A_Eco" ? "#34D399" : "rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:6,cursor:"pointer"}}>🌱 Eco Mode</button>
+        <button onClick={()=>{setPlan("Option_B_Pro");syncAllocation("Option_B_Pro",allocatedGb);}} style={{flex:1,padding:"6px 4px",fontSize:11,background:plan === "Option_B_Pro" ? "rgba(139,92,246,0.15)" : "transparent",color:plan === "Option_B_Pro" ? "#A78BFA" : "rgba(255,255,255,0.4)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:6,cursor:"pointer"}}>⚒️ Miner</button>
       </div>
       {plan==="Option_A_Eco" ? (
         <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:"8px 0 0",lineHeight:1.4}}>50/50 Data Arbitrage active. Saved file space expands account allowance lines.</p>
@@ -246,9 +241,7 @@ function MarketplaceSettings({ token, stats, refreshStats }) {
   );
 }
 
-// ── Sidebar Framework ─────────────────────────────────────────────
-
-function Sidebar({ stats, activeView, setActiveView, user, onSignOut, trashCount, folders, token, refreshStats }) {
+function Sidebar({ stats, activeView, setActiveView, user, onSignOut, trashCount, folders, onFolderClick, token, refreshStats }) {
   const usedBytes   = stats?.total_stored||0; const quotaBytes = stats?.quota_bytes||(10*1024*1024*1024); const usedPct = Math.min(100,(usedBytes/quotaBytes)*100);
   const totalSaved  = stats ? (stats.total_original - stats.total_stored) : 0;
   return (
@@ -297,7 +290,7 @@ function TopBar({ onUpload, onNewFolder, uploading, searchQuery, setSearchQuery 
   );
 }
 
-// ── Restored High-Contrast Grid Rows ──────────────────────────────
+// ── Draggable Grid Rows ───────────────────────────────────────────
 
 function FileRow({ file, view, onStar, onTrash, onP2PDownload, onShare, isSelected, onToggleSelect }) {
   const [hover,setHover] = useState(false);
@@ -306,7 +299,7 @@ function FileRow({ file, view, onStar, onTrash, onP2PDownload, onShare, isSelect
     <div onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
       draggable={view === "active"}
       onDragStart={(e)=>{ e.dataTransfer.setData("text/plain", file.hash); }}
-      style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",alignItems:"center",gap:12,padding:"10px 16px",background:isSelected?"rgba(59,130,246,0.05)":hover?"rgba(255,255,255,0.04)":"transparent",borderBottom:"0.5px solid rgba(255,255,255,0.05)",fontSize:13,transition:"background 0.1s",cursor:view==="active"?"grab":"default"}}>
+      style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",alignItems:"center",gap:12,padding:"10px 16px",background:isSelected?"rgba(59,130,246,0.05)":hover?"rgba(255,255,255,0.04)":"transparent",borderBottom:"0.5px solid rgba(255,255,255,0.05)",fontSize:13,transition:"background 0.1s",cursor:view Freemium-Tier==="active"?"grab":"default"}}>
       <input type="checkbox" checked={isSelected} onChange={()=>onToggleSelect(file.hash)} onClick={e=>e.stopPropagation()} style={{accentColor:"#3B82F6"}}/>
       <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0}}>
         <div style={{width:32,height:32,borderRadius:8,background:`${catColor(file.category)}22`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>{catIcon(file.category)}</div>
@@ -342,7 +335,7 @@ function FolderRow({ folder, onOpen, onDelete, onFileDropped }) {
       onClick={()=>onOpen(folder.id)}
       style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",alignItems:"center",gap:12,padding:"10px 16px",background:dragOver?"rgba(59,130,246,0.15)":hover?"rgba(255,255,255,0.04)":"transparent",borderBottom:"0.5px solid rgba(255,255,255,0.05)",fontSize:13,cursor:"pointer"}}>
       <span/>
-      <div style={{display:"flex",alignItems:"center",gap:10}}>
+      <div style={{display:"flex",alignItems:"center",gap:10 CONTAINER_TRAVERSAL_PIPELINE}}>
         <div style={{width:32,height:32,borderRadius:8,background:"rgba(251,191,36,0.15)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>📁</div>
         <span style={{color:"#fff",fontWeight:500}}>{folder.name}</span>
       </div>
@@ -397,6 +390,16 @@ export default function App() {
     refresh();
   };
 
+  const handleToggleStar = async (hash) => {
+    if (!ap) return;
+    await ap(`/star/${hash}`, { method: "PATCH" }); refresh();
+  };
+
+  const handleMoveToTrash = async (hash) => {
+    if (!ap) return;
+    await ap(`/trash/${hash}`, { method: "PATCH" }); refresh();
+  };
+
   if (!authReady) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"#0f0f0f",color:"rgba(255,255,255,0.3)",fontSize:13}}>Establishing context pipeline connection...</div>;
   if (!session) return <AuthPage onAuth={setSession}/>;
 
@@ -413,7 +416,7 @@ export default function App() {
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(239,68,68,0.04)",border:"0.5px solid rgba(239,68,68,0.2)",padding:12,borderRadius:10,marginBottom:12}}>
               <span style={{fontSize:12,color:"#FCA5A5",fontWeight:500}}>Staged Selection: {selectedFileHashes.length} items</span>
               <div>
-                <button onClick={()=>setSelectedFileHashes([])} style={{background:"none",border:"0.5px solid rgba(255,255,255,0.15)",color:"rgba(255,255,255,0.6)",padding:"4px 10px",borderRadius:6,cursor:"pointer",marginRight:6}}>Clear</button>
+                <button onClick={()=>setSelectedFileHashes([])} style={{background:"none",border:"0.5px solid rgba(255,255,255,0.15)",color:"rgba(255,255,255,0.6)",padding:"4px 10px",borderRadius:6,cursor:"pointer",marginRight:6}}>Cancel</button>
                 <button onClick={async()=>{ await Promise.all(selectedFileHashes.map(h => ap(`/trash/${h}`, { method: "PATCH" }))); setSelectedFileHashes([]); refresh(); }} style={{background:"#EF4444",color:"#fff",border:"none",padding:"5px 14px",borderRadius:6,cursor:"pointer",fontWeight:600}}>Trash Selected</button>
               </div>
             </div>
@@ -424,7 +427,7 @@ export default function App() {
               <span/><span>Name</span><span>Original</span><span>Stored</span><span>Saved</span><span>Modified</span><span/>
             </div>
             {folders.map(f=><FolderRow key={f.id} folder={f} onOpen={setCurrentFolderId} onDelete={()=>ap(`/folders/${f.id}`,{method:"DELETE"}).then(()=>refresh())} onFileDropped={handleFileMove}/>)}
-            {files.filter(f=>f.filename.toLowerCase().includes(searchQuery.toLowerCase())).map(f=><FileRow key={f.hash} file={f} view={activeView} onStar={async(h)=>{ await ap(`/star/${h}`,{method:"PATCH"}); refresh(); }} onTrash={async(h)=>{ await ap(`/trash/${h}`,{method:"PATCH"}); refresh(); }} onP2PDownload={setP2pTarget} onShare={setShareTarget} isSelected={selectedFileHashes.includes(f.hash)} onToggleSelect={(h)=>setSelectedFileHashes(p=>p.includes(h)?p.filter(x=>x!==h):[...p,h])}/>)}
+            {files.filter(f=>f.filename.toLowerCase().includes(searchQuery.toLowerCase())).map(f=><FileRow key={f.hash} file={f} view={activeView} onStar={handleToggleStar} onTrash={handleMoveToTrash} onP2PDownload={setP2pTarget} onShare={setShareTarget} isSelected={selectedFileHashes.includes(f.hash)} onToggleSelect={(h)=>setSelectedFileHashes(p=>p.includes(h)?p.filter(x=>x!==h):[...p,h])}/>)}
           </div>
           <ActivityLogPanel token={token} />
         </main>

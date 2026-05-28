@@ -1,589 +1,393 @@
-"""
-Nexus Production Server – Phase 10 (Sprint 3 Core Delivery Engine)
-===================================================================
-Core Features:
-  - Feature 1: Client-Side Pre-Compression (WASM Header Handshake Bypass)
-  - Feature 2: Resumable Chunked Upload Tracking Framework
-  - Feature 3: Tokenized Anonymous Public Share Links & Secure Joined List Resolvers
-  - Sprint 1: Global Multi-Folder Index Search, Checkbox Bulk Actions, HTML5 Drag-and-Drop
-  - Sprint 2: Automated Incremental File Versioning, Secure Private Email Sharing, Immutable Auditing Log Feed
-  - Sprint 3: Chunked Context Streaming Generators, Memory Optimized Decryption Pipelines, Fixed API Prefixes
-"""
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { createClient } from "@supabase/supabase-js";
 
-from flask import Flask, request, jsonify, send_file, send_from_directory, g, Response, stream_with_context
-from flask_cors import CORS
-from flask_sock import Sock
-import zstandard as zstd
-import hashlib, os, json, time, io, secrets, base64, threading, binascii
-from functools import wraps
-from datetime import datetime, timezone, timedelta
+const SUPABASE_URL      = "https://hoqzrxxqczxwwnqimvxm.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhvcXpyeHhxY3p4d3ducWltdnhtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyNzAzMzgsImV4cCI6MjA4Mjg0NjMzOH0.KWrM31jwQu98qevgPKbSzEIrsulKpjxiBQ1X4QlkHFc";
+const supabase  = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const API                = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const WS_URL             = import.meta.env.VITE_WS_URL  || "ws://localhost:5000/ws";
+const RESUMABLE_THRESHOLD = 10 * 1024 * 1024;
+const CHUNK_SIZE          = 256 * 1024;
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-import jwt as pyjwt
-from supabase import create_client, Client
+// ── Shared UI Format Utilities ────────────────────────────────────
 
-import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor
-import pickle
+const fmt = (b) => {
+  if (!b || b===0) return "0 B";
+  const k=1024, s=["B","KB","MB","GB","TB"], i=Math.floor(Math.log(b)/Math.log(k));
+  return parseFloat((b/Math.pow(k,i)).toFixed(1))+" "+s[i];
+};
+const relTime = (ts) => {
+  if (!ts) return "—";
+  const t = typeof ts==="string" ? new Date(ts).getTime()/1000 : ts;
+  const d = Date.now()/1000 - t;
+  if (d<60) return "just now";
+  if (d<3600) return Math.floor(d/60)+"m ago";
+  if (d<86400) return Math.floor(d/3600)+"h ago";
+  return Math.floor(d/86400)+"d ago";
+};
+const catIcon  = (c) => ({image:"🖼️",video:"🎬",audio:"🎵",document:"📄",archive:"📦",code:"💻",other:"📎"})[c]||"📎";
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+const apiFetch = (token) => (path, opts={}) =>
+  fetch(`${API}${path}`, { ...opts, headers:{ Authorization:`Bearer ${token}`, ...opts.headers }});
 
-app = Flask(__name__, static_folder="dist", static_url_path="")
-IS_PRODUCTION = os.environ.get("RENDER") == "true"
+// ── Client Compression & Assembly Operations ──────────────────────
 
-CORS(app,
-     resources={r"*": {"origins": [
-         "http://localhost:5173","http://localhost:3000","http://localhost:5174",
-         "http://127.0.0.1:5173","http://127.0.0.1:3000",
-         "https://nexuscompressorstore.onrender.com",
-         "https://nexus-compressor-store.vercel.app",
-     ]}},
-     supports_credentials=True,
-     allow_headers=["Authorization","Content-Type","X-Pre-Compressed",
-                    "X-Original-Size","X-Entropy"],
-     methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-     expose_headers=["Content-Disposition"])
+function computeEntropy(bytes) {
+  const sample = bytes.slice(0, 4096); const counts = new Array(256).fill(0);
+  for (let i = 0; i < sample.length; i++) counts[sample[i]]++;
+  let entropy = 0;
+  for (let i = 0; i < 256; i++) {
+    if (counts[i] === 0) continue;
+    const p = counts[i] / sample.length; entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
 
-sock = Sock(app)
+async function compressClientSide(file) {
+  const ext = "." + file.name.split(".").pop().toLowerCase();
+  if (new Set([".jpg",".jpeg",".png",".gif",".webp",".mp4",".mkv",".zip",".7z"]).has(ext)) return { compressed: null, skipped: true };
+  if (!window.ZstdCodec) return { compressed: null, skipped: true };
+  try {
+    const uint8 = new Uint8Array(await file.arrayBuffer()); const entropy = computeEntropy(uint8);
+    if (entropy > 7.5) return { compressed: null, skipped: true, entropy };
+    return new Promise((resolve) => {
+      window.ZstdCodec.run(zstd => {
+        const compressed = new zstd.Simple().compress(uint8, 6);
+        resolve({ compressed, originalSize: uint8.length, compressedSize: compressed.length, ratio: uint8.length/compressed.length, entropy, skipped: false });
+      });
+    });
+  } catch(e) { return { compressed: null, skipped: true }; }
+}
 
-# ── Config ────────────────────────────────────────────────────────────────────
+async function resumableUpload(file, token, folderId, onProgress) {
+  const ap = apiFetch(token); onProgress({ stage: "compressing", pct: 50 });
+  const compResult = await compressClientSide(file); const useComp = !compResult.skipped;
+  const finalData = useComp ? compResult.compressed : new Uint8Array(await file.arrayBuffer());
+  const totalChunks = Math.ceil(finalData.length / CHUNK_SIZE);
 
-SUPABASE_URL         = os.environ.get("SUPABASE_URL",         "https://hoqzrxxqczxwwnqimvxm.supabase.co")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-SUPABASE_JWT_SECRET  = os.environ.get("SUPABASE_JWT_SECRET",  "")
-ADMIN_EMAIL          = os.environ.get("ADMIN_EMAIL",          "rushailharjai10@gmail.com")
+  const initRes = await ap("/upload/init", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: file.name, total_size: file.size, total_chunks: totalChunks, folder_id: folderId, pre_compressed: useComp })});
+  const { session_id } = await initRes.json();
 
-BLOB_BUCKET         = "nexus-blobs"
-CHUNK_BUCKET        = "nexus-chunks"
-CHUNK_SIZE          = 256 * 1024
-TRASH_DAYS          = 7
-QUOTA_BYTES         = 10 * 1024 * 1024 * 1024
-NONCE_SIZE          = 12
-ML_MODEL_DIR        = "./ml_models"
-UPLOAD_SESSIONS_DIR = "./upload_sessions"
+  for (let i = 0; i < totalChunks; i++) {
+    const fd = new FormData(); fd.append("session_id", session_id); fd.append("chunk_index", String(i));
+    fd.append("chunk", new Blob([finalData.slice(i*CHUNK_SIZE, (i+1)*CHUNK_SIZE)]));
+    await ap("/upload/chunk", { method: "POST", body: fd });
+    onProgress({ stage: "uploading", pct: Math.round(((i + 1) / totalChunks) * 100) });
+  }
+  const finishRes = await ap("/upload/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id, entropy: compResult.entropy || null })});
+  return finishRes.json();
+}
 
-# Sprint 3 Routing Prefixes Definition Block
-API_PREFIXES = (
-    "/upload", "/files", "/folders", "/share", "/shared-with-me",
-    "/p/", "/star/", "/trash/", "/restore/", "/delete/",
-    "/download/", "/quota", "/stats", "/activity-logs", "/admin/", "/ws"
-)
+// ── Modals & Auxiliary Core Interfaces ────────────────────────────
 
-os.makedirs(ML_MODEL_DIR, exist_ok=True)
-os.makedirs(UPLOAD_SESSIONS_DIR, exist_ok=True)
+function UploadProgressModal({ filename, progress }) {
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.8)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300}}>
+      <div style={{background:"#111",border:"1px solid #222",borderRadius:16,padding:"1.5rem",width:400,fontFamily:"monospace"}}>
+        <p style={{margin:"0 0 8px",color:"#EF4444"}}>⚡ STREAM_INGEST_PIPELINE</p>
+        <p style={{fontSize:12,color:"#666",overflow:"hidden",textOverflow:"ellipsis"}}>{filename}</p>
+        <div style={{height:4,background:"#222",marginTop:12,borderRadius:2,overflow:"hidden"}}>
+          <div style={{height:"100%",background:"#EF4444",width:`${progress?.pct || 0}%`,transition:"width 0.1s"}}/>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-print(f"[nexus] Phase 10 Streaming Kernel Ready → {SUPABASE_URL}")
+function P2PDownloader({ file, token, onClose }) {
+  useEffect(() => {
+    fetch(`${API}/download/${file.hash}`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => {
+        if (!res.ok) throw new Error("Stream connection dropped");
+        return res.blob();
+      })
+      .then(blob => {
+        const url = URL.createObjectURL(blob); const a = document.createElement("a");
+        a.href = url; a.download = file.filename; a.click(); URL.revokeObjectURL(url); onClose();
+      })
+      .catch(() => onClose());
+  }, [file.hash, token, file.filename, onClose]);
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300,fontFamily:"monospace",color:"#EF4444"}}>INGEST: Downloading structural data streams sequentially...</div>;
+}
 
-# ── Master secret ─────────────────────────────────────────────────────────────
+function NewFolderModal({ token, parentId, onCreated, onClose }) {
+  const [name,setName] = useState("");
+  const executeCreate = async () => {
+    if(!name.trim()) return;
+    await apiFetch(token)("/folders",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.trim(),parent_id:parentId})});
+    onCreated(); onClose();
+  };
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.8)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#161616",padding:"1.5rem",borderRadius:12,border:"1px solid #222",fontFamily:"monospace"}}>
+        <p style={{margin:"0 0 10px",color:"#fff",fontSize:12}}>ALLOCATE_NEW_DIRECTORY</p>
+        <input autoFocus value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&executeCreate()} placeholder="Identifier..." style={{padding:10,background:"#222",border:"1px solid #333",color:"#fff",borderRadius:6,outline:"none"}}/>
+        <button onClick={executeCreate} style={{marginLeft:8,padding:"10px 16px",background:"#3B82F6",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontWeight:600}}>Build</button>
+      </div>
+    </div>
+  );
+}
 
-def _load_master_secret() -> bytes:
-    env = os.environ.get("MASTER_SECRET", "")
-    if env:
-        try:
-            decoded = binascii.unhexlify(env)
-            if len(decoded) == 32: return decoded
-        except Exception: pass
-        return hashlib.sha256(env.encode()).digest()
-    secret_file = "./master.secret"
-    if os.path.exists(secret_file):
-        with open(secret_file, "rb") as f: return f.read()
-    s = secrets.token_bytes(32)
-    with open(secret_file, "wb") as f: f.write(s)
-    return s
+function AuthPage({ onAuth }) {
+  const [email,setEmail] = useState(""); const [password,setPassword] = useState("");
+  const submit = async () => {
+    const {data,error} = await supabase.auth.signInWithPassword({email,password});
+    if(!error) onAuth(data.session);
+  };
+  return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"#0a0a0a"}}>
+      <div style={{width:350,padding:"2rem",background:"#161616",borderRadius:16,border:"1px solid #222"}}>
+        <input type="email" placeholder="Identity mail handle" value={email} onChange={e=>setEmail(e.target.value)} style={{width:"100%",padding:10,background:"#222",border:"none",color:"#fff",borderRadius:8}}/>
+        <input type="password" placeholder="Key" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} style={{width:"100%",padding:10,marginTop:10,background:"#222",border:"none",color:"#fff",borderRadius:8}}/>
+        <button onClick={submit} style={{width:"100%",padding:10,marginTop:15,background:"#EF4444",color:"#fff",border:"none",borderRadius:8,cursor:"pointer"}}>Establish Session</button>
+      </div>
+    </div>
+  );
+}
 
-MASTER_SECRET = _load_master_secret()
+// ── Sprint 2 Share Panel with Fixed Hex Color Tokens ─────────────────────────
 
-# ── Encryption ────────────────────────────────────────────────────────────────
+function ShareModal({ file, token, onClose }) {
+  const [email, setEmail] = useState(""); const [shares, setShares] = useState([]); const [publicLink, setPublicLink] = useState(null); const [copied, setCopied] = useState(false); const [success, setSuccess] = useState(""); const ap = useMemo(() => apiFetch(token), [token]);
+  const loadData = () => {
+    ap(`/share/${file.hash}`).then(r=>r.json()).then(d=>{ if(Array.isArray(d)) setShares(d); });
+    ap(`/share/${file.hash}/public`).then(r=>r.json()).then(d=>{ if(d.exists) setPublicLink(d.public_url); });
+  };
+  useEffect(() => { loadData(); }, [file.hash]); // eslint-disable-line
+  const handleShare = async () => {
+    if(!email.trim()) return;
+    const res = await ap(`/share/${file.hash}`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({email:email.trim().toLowerCase()})});
+    if(res.ok) { setSuccess(`Channel access authorized for ${email}`); setEmail(""); loadData(); }
+  };
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#111",borderRadius:14,padding:"1.5rem",width:460,border:"1px solid #222",fontFamily:"monospace"}}>
+        <p style={{margin:0,color:"#fff",fontSize:13}}>🔗 COURIER_ROUTING_CHANNEL_PROVISIONER</p>
+        <div style={{background:"rgba(255,255,255,0.01)",padding:12,borderRadius:8,margin:"12px 0",border:"1px solid #1a1a1a"}}>
+          <div style={{display:"flex",gap:6}}>
+            <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="Target node email..." style={{flex:1,padding:8,background:"#141414",border:"1px solid #222",color:"#fff",borderRadius:6,fontSize:12}}/>
+            <button onClick={handleShare} style={{background:"#3B82F6",color:"#fff",border:"none",borderRadius:6,padding:"0 12px",cursor:"pointer"}}>Authorize</button>
+          </div>
+          {success && <p style={{color:"#10B981",fontSize:11,margin:"6px 0 0"}}>{success}</p>}
+        </div>
+        {publicLink ? (
+          <div style={{display:"flex",gap:6}}>
+            <input readOnly value={publicLink} style={{flex:1,padding:8,background:"#141414",border:"1px solid #222",color:"#666",borderRadius:6,fontSize:11}}/>
+            <button onClick={()=>{navigator.clipboard.writeText(publicLink);setCopied(true);}} style={{background:"#222",color:"#fff",border:"1px solid #333",padding:"0 12px",borderRadius:6}}>{copied?"✓":"Copy"}</button>
+          </div>
+        ) : <button onClick={async()=>{ const r=await ap(`/share/${file.hash}/public`,{method:"POST"}); const d=await r.json(); setPublicLink(d.public_url); }} style={{width:"100%",padding:10,background:"#161616",border:"1px solid #222",color:"#10B981",borderRadius:6,cursor:"pointer"}}>Build Anonymous Gateway Access Link</button>}
+        {shares.length > 0 && (
+          <div style={{marginTop:12,maxHeight:100,overflowY:"auto"}}>
+            {/* FIXED: Quotes added to hex color tokens below to resolve Rolldown build errors */}
+            {shares.map(s=><div key={s.shared_with} style={{fontSize:11,color:"#aaa",padding:"3px 0"}}>• {s.shared_with} <span style={{color:"#333"}}>({relTime(s.created_at)})</span></div>)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-def derive_key(fh: str) -> bytes:
-    return HKDF(algorithm=hashes.SHA256(), length=32,
-                salt=bytes.fromhex(fh), info=b"nexus-file-enc").derive(MASTER_SECRET)
+// ── Sprint 2 Activity Logs Monitoring Feed ─────────────────────────
 
-def encrypt(data: bytes, fh: str) -> bytes:
-    nonce = secrets.token_bytes(NONCE_SIZE)
-    return nonce + AESGCM(derive_key(fh)).encrypt(nonce, data, None)
+function ActivityLogPanel({ token }) {
+  const [logs, setLogs] = useState([]);
+  useEffect(() => {
+    if(token) apiFetch(token)("/activity-logs").then(r=>r.json()).then(d => { if(Array.isArray(d)) setLogs(d); });
+  }, [token]);
+  return (
+    <div style={{background:"rgba(255,255,255,0.01)",border:"1px solid #141414",padding:14,borderRadius:12,marginTop:14,fontFamily:"monospace"}}>
+      <p style={{margin:"0 0 10px",fontSize:11,color:"#444"}}>⚙️ KERNEL_AUDIT_TRAIL_FEED</p>
+      <div style={{maxHeight:120,overflowY:"auto",display:"flex",flexDirection:"column",gap:4}}>
+        {logs.map(l => (
+          <div key={l.id} style={{display:"flex",justifyContent:"space-between",fontSize:11,borderBottom:"1px solid #0f0f0f",paddingBottom:2}}>
+            <span style={{color:l.action_type==="UPLOAD"?"#10B981":l.action_type==="DELETE"?"#EF4444":"#3B82F6"}}>[{l.action_type}] {l.metadata?.filename || l.metadata?.destination}</span>
+            <span style={{color:"#222"}}>{relTime(l.created_at)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-def decrypt(blob: bytes, fh: str) -> bytes:
-    return AESGCM(derive_key(fh)).decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:], None)
+// ── UI Settings Dials ─────────────────────────────────────────────
 
-# ── JWT auth ──────────────────────────────────────────────────────────────────
+function MarketplaceSettings({ token, stats, refreshStats }) {
+  const [plan, setPlan] = useState("Option_A_Eco"); const [allocatedGb, setAllocatedGb] = useState(20);
+  useEffect(() => { if(stats) { setPlan(stats.current_plan||"Option_A_Eco"); setAllocatedGb(Math.round((stats.physical_bytes_allocated||0)/(1024**3))); }}, [stats]);
+  return (
+    <div style={{background:"rgba(255,255,255,0.01)",border:"1px solid #141414",borderRadius:10,padding:10,marginTop:10,fontFamily:"monospace"}}>
+      <div style={{display:"flex",gap:4}}>
+        <button onClick={()=>setPlan("Option_A_Eco")} style={{flex:1,padding:4,fontSize:10,background:plan==="Option_A_Eco"?"rgba(16,185,129,0.1)":"transparent",color:"#10B981",border:"none",cursor:"pointer"}}>🌱 Eco</button>
+        <button onClick={()=>setPlan("Option_B_Pro")} style={{flex:1,padding:4,fontSize:10,background:plan==="Option_B_Pro"?"rgba(139,92,246,0.1)":"transparent",color:"#A78BFA",border:"none",cursor:"pointer"}}>⚒️ Miner</button>
+      </div>
+      {plan==="Option_A_Eco" ? (
+        <p style={{fontSize:10,color:"#444",marginTop:6}}>Compress delta bonus factor active.</p>
+      ) : (
+        <div style={{marginTop:6}}>
+          <input type="range" min="10" max="500" value={allocatedGb} onChange={e=>setAllocatedGb(e.target.value)} style={{width:"100%"}}/>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#A78BFA"}}><span>Host: {allocatedGb}GB</span><span>Yield: ${parseFloat(stats?.balance_usd||0).toFixed(4)}</span></div>
+        </div>
+      )}
+    </div>
+  );
+}
 
-def verify_token(token: str):
-    if SUPABASE_JWT_SECRET:
-        try: return pyjwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        except Exception: pass
-    try: return pyjwt.decode(token, options={"verify_signature": False}, algorithms=["HS256"])
-    except Exception: return None
+function Sidebar({ stats, activeView, setActiveView, user, onSignOut, trashCount, folders, onFolderClick, token, refreshStats }) {
+  return (
+    <aside style={{width:215,padding:"1rem 0.75rem",borderRight:"1px solid #141414",display:"flex",flexDirection:"column",gap:2}}>
+      {[{id:"active",icon:"🗂️",label:"My Files"},{id:"trash",icon:"🗑️",label:"Trash Collection",badge:trashCount}].map(item=>(
+        <button key={item.id} onClick={()=>setActiveView(item.id)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:activeView===item.id?"rgba(255,255,255,0.04)":"transparent",color:"#fff",border:"none",cursor:"pointer",borderRadius:8,fontFamily:"monospace",fontSize:13}}><span style={{display:"flex",alignItems:"center",gap:10}}><span>{item.icon}</span>{item.label}</span></button>
+      ))}
+      {/* FIXED: Quotes added around text color key targets below */}
+      <div style={{marginTop:"auto",padding:10,background:"#111",borderRadius:10}}><p style={{margin:0,fontSize:11,color:"#666"}}>{fmt(stats?.total_stored||0)} shared</p></div>
+      <MarketplaceSettings token={token} stats={stats} refreshStats={refreshStats} />
+      <button onClick={onSignOut} style={{background:"none",border:"1px solid #222",color:"#666",borderRadius:6,padding:6,cursor:"pointer",marginTop:6,fontFamily:"monospace",fontSize:11}}>Channel Terminate</button>
+    </aside>
+  );
+}
 
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "): return jsonify({"error": "Unauthorized"}), 401
-        payload = verify_token(auth[7:])
-        if not payload: return jsonify({"error": "Unauthorized"}), 401
-        g.uid   = payload.get("sub")
-        g.email = payload.get("email", "")
-        return f(*args, **kwargs)
-    return decorated
+function TopBar({ onUpload, onNewFolder, uploading, searchQuery, setSearchQuery }) {
+  return (
+    <header style={{height:58,display:"flex",alignItems:"center",gap:12,padding:"0 1.25rem",borderBottom:"1px solid #141414",background:"#0f0f0f",width:"100%"}}>
+      <span style={{fontSize:16,fontWeight:700,fontFamily:"monospace",color:"#fff"}}>⬡ VIRUS_LABS // NEXUS</span>
+      <input value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="🔍 Query structural layout indices network-wide..." style={{flex:1,maxWidth:400,marginLeft:20,padding:"8px 12px",background:"#141414",border:"1px solid #222",color:"#fff",borderRadius:8,fontSize:12,fontFamily:"monospace",outline:"none"}}/>
+      <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+        <button onClick={onNewFolder} style={{background:"#141414",color:"#fff",border:"1px solid #333",padding:"6px 12px",borderRadius:6,cursor:"pointer",fontSize:11}}>+ Folder</button>
+        <button onClick={onUpload} style={{background:"#EF4444",color:"#fff",border:"none",padding:"6px 16px",borderRadius:6,cursor:"pointer",fontWeight:600,fontSize:11}}>{uploading?"Streaming...":"⬆ Upload"}</button>
+      </div>
+    </header>
+  );
+}
 
-def require_admin(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "): return jsonify({"error": "Unauthorized"}), 401
-        payload = verify_token(auth[7:])
-        if not payload: return jsonify({"error": "Unauthorized"}), 401
-        g.uid   = payload.get("sub")
-        g.email = payload.get("email", "")
-        res = sb.table("admins").select("user_id").eq("user_id", g.uid).limit(1).execute()
-        if not res.data and g.email != ADMIN_EMAIL: return jsonify({"error": "Forbidden"}), 403
-        return f(*args, **kwargs)
-    return decorated
+// ── File and Folder rows (Draggable drop target interfaces) ──────────────────
 
-# ── Activity Auditing Helper ──────────────────────────────────────────────────
+function FileRow({ file, view, onStar, onTrash, onP2PDownload, onShare, isSelected, onToggleSelect }) {
+  const [hover,setHover] = useState(false);
+  return (
+    <div onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+      draggable={view === "active"}
+      onDragStart={(e)=>{ e.dataTransfer.setData("text/plain", file.hash); }}
+      style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",alignItems:"center",gap:12,padding:"10px 16px",background:isSelected?"rgba(239,68,68,0.03)":hover?"rgba(255,255,255,0.02)":"transparent",borderBottom:"1px solid #141414",fontSize:13,fontFamily:"monospace",cursor:view==="active"?"grab":"default"}}>
+      <input type="checkbox" checked={isSelected} onChange={()=>onToggleSelect(file.hash)} onClick={e=>e.stopPropagation()} style={{accentColor:"#EF4444"}}/>
+      <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+        <span style={{color: catColor(file.category)}}>{catIcon(file.category)}</span>
+        <span style={{color:"#fff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{file.filename}</span>
+        {file.version_number > 1 && <span style={{fontSize:9,background:"rgba(139,92,246,0.15)",color:"#A78BFA",padding:"1px 4px",borderRadius:4}}>v{file.version_number}</span>}
+      </div>
+      <span style={{color:"#444"}}>{fmt(file.original_size)}</span>
+      <span style={{color:"#444"}}>{fmt(file.stored_size)}</span>
+      <span style={{color:"#10B981"}}>{file.original_size>0?Math.round(((file.original_size-file.stored_size)/file.original_size)*100):0}%</span>
+      <span style={{color:"#222"}}>{relTime(file.upload_time)}</span>
+      <div style={{display:"flex",gap:12}} onClick={e=>e.stopPropagation()}>
+        <button onClick={()=>onP2PDownload(file)} style={{background:"none",border:"none",color:"#3B82F6",cursor:"pointer"}}>⬇</button>
+        <button onClick={()=>onShare(file)} style={{background:"none",border:"none",color:"#10B981",cursor:"pointer"}}>🔗</button>
+        <button onClick={()=>onStar(file.hash)} style={{background:"none",border:"none",color:file.starred?"#FCD34D":"#222",cursor:"pointer"}}>{file.starred?"★":"☆"}</button>
+        <button onClick={()=>onTrash(file.hash)} style={{background:"none",border:"none",color:"#444",cursor:"pointer"}}>🗑</button>
+      </div>
+    </div>
+  );
+}
 
-def log_activity(uid, action_type, filename, size=0, destination=None):
-    try:
-        sb.table("activity_logs").insert({
-            "user_id": uid, "action_type": action_type,
-            "metadata": {"filename": filename, "bytes": size, "destination": destination, "timestamp": datetime.now(timezone.utc).isoformat()}
-        }).execute()
-    except Exception as e: print(f"[audit-log-error] {e}")
+function FolderRow({ folder, onOpen, onDelete, onFileDropped }) {
+  const [hover,setHover] = useState(false); const [dragOver,setDragOver] = useState(false);
+  return (
+    <div onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+      onDragOver={e=>{ e.preventDefault(); setDragOver(true); }}
+      onDragLeave={()=>setDragOver(false)}
+      onDrop={e=>{ e.preventDefault(); setDragOver(false); const fh=e.dataTransfer.getData("text/plain"); if(fh) onFileDropped(fh, folder.id); }}
+      onClick={()=>onOpen(folder.id)}
+      style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",alignItems:"center",gap:12,padding:"10px 16px",background:dragOver?"rgba(239,68,68,0.06)":hover?"rgba(255,255,255,0.01)":"transparent",borderBottom:"1px solid #141414",fontSize:13,fontFamily:"monospace",cursor:"pointer"}}>
+      <span/>
+      <span style={{color:"#F59E0B"}}>📁 {folder.name}</span>
+      <span/><span/><span/><span style={{color:"#222"}}>{relTime(folder.created_at)}</span>
+      <button onClick={(e)=>{e.stopPropagation();onDelete(folder.id);}} style={{background:"none",border:"none",color:"#333",cursor:"pointer"}}>🗑</button>
+    </div>
+  );
+}
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+// ── Main App Logic Scope Controller ───────────────────────────────
 
-def db_get_file(uid, file_hash):
-    res = sb.table("files").select("*").eq("user_id", uid).eq("hash", file_hash).limit(1).execute()
-    return res.data[0] if res.data else None
+export default function App() {
+  const [session,setSession] = useState(null); const [authReady,setAuthReady] = useState(false); const [files,setFiles] = useState([]); const [folders,setFolders] = useState([]); const [trashFiles,setTrashFiles] = useState([]); const [stats,setStats] = useState(null);
+  const [uploading,setUploading] = useState(false); const [uploadProgress,setUploadProgress] = useState(null); const [uploadFilename,setUploadFilename] = useState(""); const [result,setResult] = useState(null); const [error,setError] = useState(null); const [p2pTarget,setP2pTarget] = useState(null); const [shareTarget,setShareTarget] = useState(null); const [activeView,setActiveView] = useState("active"); const [currentFolderId,setCurrentFolderId] = useState(null); const [searchQuery,setSearchQuery] = useState(""); const [showNewFolder,setShowNewFolder] = useState(false);
+  const [selectedFileHashes, setSelectedFileHashes] = useState([]); const inputRef = useRef();
 
-def db_get_file_by_name(uid, filename, folder_id=None):
-    q = sb.table("files").select("*").eq("user_id", uid).eq("filename", filename).is_("deleted_at", "null")
-    q = q.eq("folder_id", folder_id) if folder_id else q.is_("folder_id", "null")
-    res = q.order("version_number", desc=True).limit(1).execute()
-    return res.data[0] if res.data else None
+  useEffect(()=>{
+    supabase.auth.getSession().then(({data:{session}})=>{ setSession(session); setAuthReady(true); });
+    supabase.auth.onAuthStateChange((_,s)=>setSession(s));
+  },[]);
 
-def db_list_files(uid, view="active", folder_id=None, is_global_search=False):
-    q = sb.table("files").select("*").eq("user_id", uid)
-    if view == "active":
-        q = q.is_("deleted_at", "null")
-        if not is_global_search:
-            if folder_id: q = q.eq("folder_id", folder_id)
-            else: q = q.is_("folder_id", "null")
-    elif view == "starred":
-        q = q.eq("starred", True).is_("deleted_at", "null")
-    elif view == "trash":
-        q = q.not_.is_("deleted_at", "null")
-    return (q.order("upload_time", desc=True).execute()).data or []
+  const token = session?.access_token; const ap = useMemo(()=> token ? apiFetch(token) : null, [token]);
 
-def db_upsert_file(uid, entry):
-    row = {
-        "user_id": uid, "hash": entry["hash"], "filename": entry["filename"],
-        "category": entry["category"], "original_size": entry["original_size"],
-        "stored_size": entry["stored_size"], "ratio": float(entry["ratio"]),
-        "zstd_level": entry["level"], "chunk_count": entry["chunk_count"],
-        "ref_count": entry.get("ref_count", 1), "dedup_bytes_saved": entry.get("dedup_bytes_saved", 0),
-        "encrypted": True, "starred": entry.get("starred", False), "deleted_at": entry.get("deleted_at"),
-        "upload_time": entry.get("upload_time_iso"), "folder_id": entry.get("folder_id"), "version_number": entry.get("version_number", 1)
-    }
-    if entry.get("ml_model_version") is not None: row["ml_model_version"] = entry["ml_model_version"]
-    sb.table("files").insert(row).execute()
+  const refresh = useCallback(async () => {
+    if (!ap) return;
+    try {
+      const isSearchActive = searchQuery.trim().length > 0;
+      const [fRes, tRes, sRes, folRes] = await Promise.all([
+        ap(`/files?view=${activeView}${currentFolderId?`&folder_id=${currentFolderId}`:""}${isSearchActive ? "&search=true" : ""}`),
+        ap(`/files?view=trash`), ap(`/stats`),
+        activeView==="active" ? ap(`/folders${currentFolderId?`?parent_id=${currentFolderId}`:""}`) : Promise.resolve({json:()=>[]}),
+      ]);
+      const [f, t, s, fol] = await Promise.all([fRes.json(), tRes.json(), sRes.json(), folRes.json()]);
+      setFiles(Array.isArray(f)?f:[]); setTrashFiles(Array.isArray(t)?t:[]); setStats(s); setFolders(Array.isArray(fol)?fol:[]);
+    } catch(e) { setError(e.message); }
+  }, [ap, activeView, currentFolderId, searchQuery]);
 
-def db_upsert_chunks(uid, file_hash, chunks):
-    file_row = db_get_file(uid, file_hash)
-    if not file_row: return
-    rows = [{"file_id": file_row["id"], "chunk_index": c["index"], "chunk_hash": c["id"], "size": c["size"], "storage_path": f"{uid}/{file_hash}/{c['index']}.chunk"} for c in chunks]
-    if rows: sb.table("chunks").upsert(rows, on_conflict="file_id,chunk_index").execute()
+  useEffect(()=>{ if(token) refresh(); },[token, activeView, currentFolderId, searchQuery]);
 
-def db_get_user_stats(uid):
-    res = sb.table("user_stats").select("*").eq("user_id", uid).limit(1).execute()
-    return res.data[0] if res.data else {"user_id": uid, "total_files": 0, "total_original": 0, "total_stored": 0, "total_dedup_events": 0, "total_dedup_saved": 0, "quota_bytes": QUOTA_BYTES}
+  const uploadFile = async (file) => {
+    setUploading(true); setUploadFilename(file.name); setUploadProgress({ pct: 50 });
+    try {
+      const fd = new FormData(); fd.append("file", file); if (currentFolderId) fd.append("folder_id", currentFolderId);
+      const res = await fetch(`${API}/upload`, { method: "POST", body: fd, headers: { Authorization: `Bearer ${token}` } });
+      setResult(await res.json()); refresh();
+    } catch(e) { setError(e.message); }
+    finally { setUploading(false); setUploadProgress(null); }
+  };
 
-def db_update_stats(uid, original_size, stored_size, is_dedup=False, dedup_saved=0, delete=False):
-    cur = db_get_user_stats(uid)
-    if delete:
-        cur["total_files"]    = max(0, cur.get("total_files", 0) - 1)
-        cur["total_original"] = max(0, cur.get("total_original", 0) - original_size)
-        cur["total_stored"]   = max(0, cur.get("total_stored", 0) - stored_size)
-    elif is_dedup:
-        cur["total_dedup_events"] = cur.get("total_dedup_events", 0) + 1
-        cur["total_dedup_saved"]  = cur.get("total_dedup_saved", 0) + dedup_saved
-    else:
-        cur["total_files"]    = cur.get("total_files", 0) + 1
-        cur["total_original"] = cur.get("total_original", 0) + original_size
-        cur["total_stored"]   = cur.get("total_stored", 0) + stored_size
-    cur["updated_at"] = datetime.now(timezone.utc).isoformat()
-    sb.table("user_stats").upsert(cur, on_conflict="user_id").execute()
+  const handleFileMove = async (fileHash, targetFolderId) => {
+    await ap(`/files/${fileHash}/move`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folder_id: targetFolderId }) });
+    refresh();
+  };
 
-# ── ML Optimizer Engine ───────────────────────────────────────────────────────
+  if (!authReady) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"#0a0a0a",color:"#EF4444",fontFamily:"monospace"}}>initial_boot_sequence_active...</div>;
+  if (!session) return <AuthPage onAuth={setSession}/>;
 
-CATEGORIES  = ["image","video","audio","document","archive","code","other"]
-_ml_lock    = threading.Lock()
-_ml_models  = {}
-_ml_samples = {c: [] for c in CATEGORIES}
-_ml_version = {c: 0  for c in CATEGORIES}
-
-def _model_path(c): return os.path.join(ML_MODEL_DIR, f"{c}.pkl")
-def _load_models():
-    for cat in CATEGORIES:
-        p = _model_path(cat)
-        if os.path.exists(p):
-            try:
-                with open(p, "rb") as f: _ml_models[cat] = pickle.load(f)
-            except Exception: pass
-def _save_model(c):
-    with open(_model_path(c), "wb") as f: pickle.dump(_ml_models.get(c), f)
-def _entropy(data):
-    if not data: return 0.0
-    s = data[:4096]
-    counts = np.bincount(np.frombuffer(s, dtype=np.uint8), minlength=256).astype(float)
-    p = counts / counts.sum(); p = p[p > 0]
-    return float(-np.sum(p * np.log2(p)))
-def _feat(sz, lvl, ent): return np.array([[np.log1p(sz), lvl/22.0, ent/8.0]])
-def _predict(cat, sz, lvl, ent):
-    with _ml_lock: model = _ml_models.get(cat)
-    if model is None:
-        base = {"image":1.05,"video":1.02,"audio":1.03,"document":3.5,"archive":1.01,"code":6.0,"other":1.5}.get(cat, 2.0)
-        return base * (1 + (lvl/22.0)*0.3)
-    try: return float(model.predict(_feat(sz, lvl, ent))[0])
-    except: return 1.0
-def _record(cat, sz, lvl, ent, ratio):
-    with _ml_lock:
-        _ml_samples[cat].append((_feat(sz, lvl, ent)[0], ratio))
-        samp = _ml_samples[cat]
-        if len(samp) >= 5 and len(samp) % 3 == 0:
-            X = np.array([s[0] for s in samp]); y = np.array([s[1] for s in samp])
-            m = GradientBoostingRegressor(n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42)
-            m.fit(X, y); _ml_models[cat] = m; _ml_version[cat] += 1; _save_model(cat)
-def best_level_ml(cat, sz, ent):
-    cands = [1, 3, 6, 9, 12, 15, 19, 22]; bl, bp = 5, 0.0
-    for lvl in cands:
-        p = _predict(cat, sz, lvl, ent)
-        if p > bp: bp, bl = p, lvl
-    return bl
-_load_models()
-
-# ── Storage Matrix Handlers ───────────────────────────────────────────────────
-
-def storage_upload(bucket, path, data): sb.storage.from_(bucket).upload(path, data, file_options={"content-type": "application/octet-stream", "upsert": "true"})
-def storage_download(bucket, path): return sb.storage.from_(bucket).download(path)
-def storage_delete(bucket, paths):
-    if paths: sb.storage.from_(bucket).remove(paths)
-def blob_path(uid, fh):     return f"{uid}/{fh}.zst.enc"
-def chunk_path(uid, fh, i): return f"{uid}/{fh}/{i}.chunk"
-def split_upload_chunks(data, fh, uid):
-    chunks = []
-    for i in range(0, len(data), CHUNK_SIZE):
-        chunk = data[i:i+CHUNK_SIZE]; idx = i // CHUNK_SIZE
-        storage_upload(CHUNK_BUCKET, chunk_path(uid, fh, idx), chunk)
-        chunks.append({"id": hashlib.sha256(chunk).hexdigest()[:16], "index": idx, "size": len(chunk)})
-    return chunks
-def delete_from_storage(uid, fh, chunk_count):
-    storage_delete(BLOB_BUCKET, [blob_path(uid, fh)])
-    paths = [chunk_path(uid, fh, i) for i in range(chunk_count)]
-    if paths: storage_delete(CHUNK_BUCKET, paths)
-
-# ── Processor Core Pipe ───────────────────────────────────────────────────────
-
-def _process_and_store(uid, filename, original_data, folder_id=None, pre_compressed=False, client_original_size=None, client_entropy=None):
-    category   = file_category(filename)
-    ml_version = _ml_version.get(category, 0)
-
-    if pre_compressed:
-        compressed_data = original_data; original_size = client_original_size or len(original_data); chosen_level = 0; entropy = client_entropy or 0.0
-        best_ratio = original_size / len(compressed_data) if compressed_data else 1.0
-        _record(category, original_size, 6, entropy, best_ratio)
-    else:
-        original_size = len(original_data); entropy = _entropy(original_data); best_level = best_level_ml(category, original_size, entropy)
-        best_data, best_ratio, chosen_level = None, 0.0, best_level
-        for lvl in sorted(set([max(1, best_level-1), best_level, min(22, best_level+1)])):
-            comp = zstd.ZstdCompressor(level=lvl).compress(original_data); r = original_size / len(comp) if comp else 1
-            if r > best_ratio: best_data, best_ratio, chosen_level = comp, r, lvl
-        _record(category, original_size, chosen_level, entropy, best_ratio); compressed_data = best_data
-
-    file_hash = hashlib.sha256(compressed_data).hexdigest()
-    encrypted_blob = encrypt(compressed_data, file_hash)
-    stored_size = len(encrypted_blob)
-    
-    storage_upload(BLOB_BUCKET, blob_path(uid, file_hash), encrypted_blob)
-    chunks = split_upload_chunks(compressed_data, file_hash, uid)
-
-    existing_file = db_get_file_by_name(uid, filename, folder_id)
-    next_version = (existing_file.get("version_number", 1) + 1) if existing_file else 1
-
-    entry = {
-        "hash": file_hash, "filename": filename, "category": category, "original_size": original_size, "stored_size": stored_size,
-        "ratio": round(best_ratio, 3), "level": chosen_level, "chunk_count": len(chunks), "upload_time_iso": datetime.now(timezone.utc).isoformat(),
-        "ref_count": 1, "dedup_bytes_saved": 0, "starred": False, "deleted_at": None, "ml_model_version": ml_version, "folder_id": folder_id, "version_number": next_version
-    }
-    db_upsert_file(uid, entry)
-    db_upsert_chunks(uid, file_hash, chunks)
-    db_update_stats(uid, original_size, stored_size)
-    log_activity(uid, "UPLOAD", filename, original_size)
-    
-    broadcast({"type": "file_available", "file_id": file_hash, "filename": filename, "chunk_count": len(chunks)})
-    return {"status": "uploaded", "file_id": file_hash, "hash": file_hash, "filename": filename, "category": category, "original_size": original_size, "stored_size": stored_size, "ratio": round(best_ratio, 3), "chunk_count": len(chunks), "version_number": next_version}
-
-# ── Feature 2: Resumable Tracking Dictionaries ────────────────────────────────
-
-def _session_path(sid): return os.path.join(UPLOAD_SESSIONS_DIR, sid)
-def _load_session(sid):
-    p = _session_path(sid) + ".json"
-    if not os.path.exists(p): return None
-    with open(p) as f: return json.load(f)
-def _save_session(sid, data):
-    with open(_session_path(sid) + ".json", "w") as f: json.dump(data, f)
-def _cleanup_session(sid):
-    import glob
-    for p in glob.glob(_session_path(sid) + "*"):
-        try: os.remove(p)
-        except Exception: pass
-
-# ── WebSockets & Specialized Node Signaling Framework ─────────────────────────
-
-peers = {}; peers_lock = threading.Lock()
-def peer_summary():
-    with peers_lock: return [{"peer_id": pid, "color": p["color"], "joined": p["joined"], "chunks": {fid: len(idxs) for fid, idxs in p["chunks"].items()}} for pid, p in peers.items()]
-def broadcast(msg, exclude=None):
-    data = json.dumps(msg)
-    with peers_lock:
-        dead = []
-        for pid, p in peers.items():
-            if pid == exclude: continue
-            try: p["ws"].send(data)
-            except: dead.append(pid)
-        for pid in dead: peers.pop(pid, None)
-
-@sock.route("/ws")
-def websocket(ws):
-    token = request.args.get("token", "")
-    payload = verify_token(token) if token else None
-    uid = payload.get("sub") if payload else "anonymous"
-    pid = "P-" + secrets.token_hex(4).upper()
-    with peers_lock: peers[pid] = {"ws": ws, "color": "#3B82F6", "joined": time.time(), "chunks": {}, "uid": uid}
-    ws.send(json.dumps({"type": "welcome", "peer_id": pid, "color": "#3B82F6"}))
-    try:
-        while True:
-            raw = ws.receive()
-            if raw is None: break
-    except Exception: pass
-    finally:
-        with peers_lock: peers.pop(pid, None)
-
-# ── Sprint 3: Memory Optimized Streaming Decompressor Generator ───────────────
-
-def generate_decrypted_stream(uid, file_hash):
-    """Downloads encrypted storage footprint blocks, streaming chunks directly to response context."""
-    try:
-        # Pull down raw base storage layer binary chunk array
-        blob = storage_download(BLOB_BUCKET, blob_path(uid, file_hash))
-        decrypted = decrypt(blob, file_hash)
+  return (
+    <div style={{display:"flex",flexDirection:"column",width:"100%",height:"100vh",background:"#0f0f0f",color:"#fff",overflow:"hidden"}}>
+      <TopBar onUpload={()=>inputRef.current?.click()} onNewFolder={()=>setShowNewFolder(true)} uploading={uploading} searchQuery={searchQuery} setSearchQuery={setSearchQuery}/>
+      <input ref={inputRef} type="file" style={{display:"none"}} onChange={e=>{ if(e.target.files[0]) uploadFile(e.target.files[0]); }}/>
+      
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        <Sidebar stats={stats} activeView={activeView} setActiveView={(v)=>{ setActiveView(v); setSearchQuery(""); setCurrentFolderId(null); setSelectedFileHashes([]); }} user={session.user} onSignOut={async()=>await supabase.auth.signOut()} trashCount={trashFiles.length} folders={folders} onFolderClick={setCurrentFolderId} token={token} refreshStats={refresh}/>
         
-        # Stream output via buffer sizes to prevent platform heap explosions
-        decompressor = zstd.ZstdDecompressor()
-        uncompressed = decompressor.decompress(decrypted)
-        
-        buffer = io.BytesIO(uncompressed)
-        while True:
-            chunk = buffer.read(512 * 1024) # Send 512 KB segments iteratively
-            if not chunk: break
-            yield chunk
-    except Exception as stream_err:
-        print(f"[streaming-exception-layer] Framework break: {stream_err}")
-        yield b""
+        <main style={{flex:1,overflowY:"auto",padding:"1.25rem 1.5rem"}}>
+          {selectedFileHashes.length > 0 && (
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(239,68,68,0.03)",border:"1px solid rgba(239,68,68,0.2)",padding:12,borderRadius:8,marginBottom:12,fontFamily:"monospace"}}>
+              <span style={{fontSize:11,color:"#EF4444"}}>STAGED_MUTATION_QUEUE // {selectedFileHashes.length} OBJECTS</span>
+              <div>
+                <button onClick={()=>setSelectedFileHashes([])} style={{background:"none",border:"1px solid #333",color:"#fff",padding:"4px 8px",borderRadius:4,marginRight:6,cursor:"pointer",fontSize:11}}>Cancel</button>
+                <button onClick={async()=>{ await Promise.all(selectedFileHashes.map(h => ap(`/trash/${h}`, { method: "PATCH" }))); setSelectedFileHashes([]); refresh(); }} style={{background:"#EF4444",color:"#fff",border:"none",padding:"4px 12px",borderRadius:4,cursor:"pointer",fontSize:11,fontWeight:600}}>Trash Batch</button>
+              </div>
+            </div>
+          )}
 
-# ── API Paths & Endpoint Management ───────────────────────────────────────────
+          <div style={{background:"rgba(255,255,255,0.01)",border:"1px solid #141414",borderRadius:12,overflow:"hidden"}}>
+            <div style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",padding:"8px 16px",background:"#111",fontSize:11,color:"#444",fontFamily:"monospace",textTransform:"uppercase"}}>
+              <span/><span>Identity Cluster</span><span>Raw Size</span><span>Mesh Footprint</span><span>Ratio</span><span>Committed</span><span/>
+            </div>
+            {folders.map(f=><FolderRow key={f.id} folder={f} onOpen={setCurrentFolderId} onDelete={()=>ap(`/folders/${f.id}`,{method:"DELETE"}).then(()=>refresh())} onFileDropped={handleFileMove}/>)}
+            {files.filter(f=>f.filename.toLowerCase().includes(searchQuery.toLowerCase())).map(f=><FileRow key={f.hash} file={f} view={activeView} onStar={async(h)=>{ await ap(`/star/${h}`,{method:"PATCH"}); refresh(); }} onTrash={async(h)=>{ await ap(`/trash/${h}`,{method:"PATCH"}); refresh(); }} onP2PDownload={setP2pTarget} onShare={setShareTarget} isSelected={selectedFileHashes.includes(f.hash)} onToggleSelect={(h)=>setSelectedFileHashes(p=>p.includes(h)?p.filter(x=>x!==h):[...p,h])}/>)}
+          </div>
+          <ActivityLogPanel token={token} />
+        </main>
+      </div>
 
-@app.route("/upload", methods=["POST"])
-@require_auth
-def upload():
-    file = request.files.get("file")
-    if not file: return jsonify({"error": "No file payload found"}), 400
-    result = _process_and_store(g.uid, file.filename, file.read(), request.form.get("folder_id"))
-    return jsonify(result)
-
-@app.route("/upload/init", methods=["POST"])
-@require_auth
-def upload_init():
-    body = request.get_json(silent=True) or {}
-    uid, session_id = g.uid, secrets.token_urlsafe(24)
-    session = {"session_id": session_id, "uid": uid, "filename": body.get("filename"), "total_size": body.get("total_size", 0), "total_chunks": body.get("total_chunks", 0), "folder_id": body.get("folder_id"), "received": [], "created_at": time.time()}
-    _save_session(session_id, session)
-    return jsonify({"session_id": session_id, "chunk_size": CHUNK_SIZE})
-
-@app.route("/upload/chunk", methods=["POST"])
-@require_auth
-def upload_chunk():
-    sid, idx = request.form.get("session_id"), int(request.form.get("chunk_index"))
-    session = _load_session(sid)
-    if not session or session["uid"] != g.uid: return jsonify({"error": "Forbidden"}), 401
-    with open(_session_path(sid) + f".chunk_{idx}", "wb") as f: f.write(request.files.get("chunk").read())
-    if idx not in session["received"]: session["received"].append(idx)
-    _save_session(sid, session)
-    return jsonify({"done": len(session["received"]) >= session["total_chunks"]})
-
-@app.route("/upload/finish", methods=["POST"])
-@require_auth
-def upload_finish():
-    sid = (request.get_json(silent=True) or {}).get("session_id")
-    session = _load_session(sid)
-    parts = []
-    for i in range(session["total_chunks"]):
-        with open(_session_path(sid) + f".chunk_{i}", "rb") as f: parts.append(f.read())
-    result = _process_and_store(session["uid"], session["filename"], b"".join(parts), session.get("folder_id"))
-    _cleanup_session(sid)
-    return jsonify(result)
-
-@app.route("/files", methods=["GET"])
-@require_auth
-def list_files():
-    is_search = request.args.get("search", "").lower() == "true"
-    return jsonify(db_list_files(g.uid, request.args.get("view", "active"), request.args.get("folder_id"), is_global_search=is_search))
-
-@app.route("/star/<file_id>", methods=["PATCH"])
-@require_auth
-def toggle_star(file_id):
-    row = db_get_file(g.uid, file_id)
-    new_val = not row.get("starred", False)
-    sb.table("files").update({"starred": new_val}).eq("user_id", g.uid).eq("hash", file_id).execute()
-    return jsonify({"starred": new_val})
-
-@app.route("/trash/<file_id>", methods=["PATCH"])
-@require_auth
-def move_to_trash(file_id):
-    row = db_get_file(g.uid, file_id)
-    sb.table("files").update({"deleted_at": datetime.now(timezone.utc).isoformat(), "starred": False}).eq("user_id", g.uid).eq("hash", file_id).execute()
-    log_activity(g.uid, "TRASH", row["filename"])
-    return jsonify({"status": "trashed"})
-
-@app.route("/restore/<file_id>", methods=["PATCH"])
-@require_auth
-def restore_from_trash(file_id):
-    sb.table("files").update({"deleted_at": None}).eq("user_id", g.uid).eq("hash", file_id).execute()
-    return jsonify({"status": "restored"})
-
-@app.route("/delete/<file_id>", methods=["DELETE"])
-@require_auth
-def delete_file(file_id):
-    row = db_get_file(g.uid, file_id)
-    delete_from_storage(g.uid, file_id, row.get("chunk_count", 0))
-    sb.table("files").delete().eq("user_id", g.uid).eq("hash", file_id).execute()
-    db_update_stats(g.uid, row.get("original_size", 0), row.get("stored_size", 0), delete=True)
-    return jsonify({"status": "deleted"})
-
-@app.route("/files/<file_hash>/move", methods=["PATCH"])
-@require_auth
-def move_file(file_hash):
-    target = (request.get_json(silent=True) or {}).get("folder_id")
-    if target in ["", "null", "ROOT"]: target = None
-    sb.table("files").update({"folder_id": target}).eq("hash", file_hash).eq("user_id", g.uid).execute()
-    return jsonify({"status": "moved"})
-
-# ── Sprint 2 Shared Assets Engine: Private Email-to-Email Sharing ─────────────
-
-@app.route("/share/<file_hash>", methods=["POST"])
-@require_auth
-def share_file(file_hash):
-    recipient = ((request.get_json(silent=True) or {}).get("email") or "").strip().lower()
-    file_row = db_get_file(g.uid, file_hash)
-    token = secrets.token_urlsafe(32)
-    sb.table("shared_files").insert({"file_id": file_row["id"], "owner_id": g.uid, "shared_with": recipient, "share_token": token}).execute()
-    log_activity(g.uid, "SHARE", file_row["filename"], destination=recipient)
-    return jsonify({"status": "shared", "shared_with": recipient}), 201
-
-@app.route("/share/<file_hash>", methods=["GET"])
-@require_auth
-def list_shares(file_hash):
-    file_row = db_get_file(g.uid, file_hash)
-    res = sb.table("shared_files").select("shared_with,created_at").eq("file_id", file_row["id"]).eq("owner_id", g.uid).not_.is_("shared_with", "null").execute()
-    return jsonify(res.data or [])
-
-@app.route("/share/<file_hash>/public", methods=["GET", "POST", "DELETE"])
-@require_auth
-def handle_public_link(file_hash):
-    file_row = db_get_file(g.uid, file_hash)
-    if request.method == "POST":
-        token = secrets.token_urlsafe(32)
-        sb.table("shared_files").upsert({"file_id": file_row["id"], "owner_id": g.uid, "share_token": token}, on_conflict="file_id").execute()
-        return jsonify({"exists": True, "public_url": f"{request.host_url}p/{token}"})
-    if request.method == "DELETE":
-        sb.table("shared_files").delete().eq("file_id", file_row["id"]).is_("shared_with", "null").execute()
-        return jsonify({"status": "revoked"})
-    res = sb.table("shared_files").select("share_token").eq("file_id", file_row["id"]).is_("shared_with", "null").limit(1).execute()
-    return jsonify({"exists": len(res.data) > 0, "public_url": f"{request.host_url}p/{res.data[0]['share_token']}" if res.data else None})
-
-@app.route("/shared-with-me", methods=["GET"])
-@require_auth
-def shared_with_me():
-    res = sb.table("shared_files").select("created_at,files(hash,filename,category,original_size,stored_size,chunk_count)").eq("shared_with", g.email.lower()).execute()
-    return jsonify(res.data or [])
-
-@app.route("/activity-logs", methods=["GET"])
-@require_auth
-def get_logs():
-    res = sb.table("activity_logs").select("*").eq("user_id", g.uid).order("created_at", desc=True).limit(50).execute()
-    return jsonify(res.data or [])
-
-# ── Sprint 3: Fully Upgraded Memory Buffer Core Downloader ────────────────────
-
-@app.route("/download/<file_id>", methods=["GET"])
-@require_auth
-def download(file_id):
-    row = db_get_file(g.uid, file_id)
-    if not row: return jsonify({"error": "Asset reference dropped"}), 404
-    
-    # Return zero-RAM context stream response generators to maximize speed efficiency
-    return Response(
-        stream_with_context(generate_decrypted_stream(g.uid, file_id)),
-        mimetype="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'}
-    )
-
-@app.route("/p/<token>", methods=["GET"])
-def public_download(token):
-    res = sb.table("shared_files").select("owner_id,files(hash,filename)").eq("share_token", token).is_("shared_with", "null").limit(1).execute()
-    if not res.data: return jsonify({"error": "Link boundary expired"}), 404
-    share = res.data[0]
-    files_data = share.get("files", [])
-    fi = files_data[0] if isinstance(files_data, list) else (files_data if isinstance(files_data, dict) else {})
-    
-    return Response(
-        stream_with_context(generate_decrypted_stream(share.get("owner_id"), fi.get("hash"))),
-        mimetype="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{fi.get("filename", "download")}"'}
-    )
-
-@app.route("/folders", methods=["GET", "POST"])
-@require_auth
-def handle_folders():
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        res = sb.table("folders").insert({"user_id": g.uid, "name": body.get("name"), "parent_id": body.get("parent_id")}).execute()
-        return jsonify(res.data[0]), 201
-    parent_id = request.args.get("parent_id")
-    q = sb.table("folders").select("*").eq("user_id", g.uid)
-    q = q.eq("parent_id", parent_id) if parent_id else q.is_("parent_id", "null")
-    return jsonify(q.execute().data or [])
-
-@app.route("/stats", methods=["GET"])
-@require_auth
-def stats():
-    s = db_get_user_stats(g.uid)
-    return jsonify({"total_files": s.get("total_files", 0), "total_original": s.get("total_original", 0), "total_stored": s.get("total_stored", 0), "quota_bytes": s.get("quota_bytes", QUOTA_BYTES), "dynamic_quota_bonus": s.get("dynamic_quota_bonus", 0), "balance_usd": float(s.get("balance_usd", 0.0)), "current_plan": s.get("current_plan", "Option_A_Eco")})
-
-# ── Catchall Single Page App Production asset serve handler ───────────────────
-
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def serve_react(path):
-    if any(("/" + path).startswith(p) for p in API_PREFIXES): return jsonify({"error": "API route target path mismatch"}), 404
-    dist = os.path.join(os.path.dirname(__file__), "dist")
-    if not os.path.exists(dist): return jsonify({"status": "online", "version": "Phase 10 Kernel"}), 200
-    if path and os.path.exists(os.path.join(dist, path)): return send_from_directory(dist, path)
-    return send_from_directory(dist, "index.html")
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
+      {uploading && uploadProgress && <UploadProgressModal filename={uploadFilename} progress={uploadProgress}/>}
+      {result && <UploadResult result={result} onClose={()=>setResult(null)}/>}
+      {showNewFolder && <NewFolderModal token={token} parentId={currentFolderId} onCreated={()=>refresh()} onClose={()=>setShowNewFolder(false)}/>}
+      {shareTarget && <ShareModal file={shareTarget} token={token} onClose={()=>setShareTarget(null)}/>}
+      {p2pTarget && <P2PDownloader file={p2pTarget} token={token} onClose={()=>setP2pTarget(null)}/>}
+    </div>
+  );
+}

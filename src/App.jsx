@@ -590,8 +590,14 @@ function ShareModal({ file, token, onClose }) {
     ap(`/share/${file.hash}`).then(r=>r.json()).then(d=>{ if(Array.isArray(d)) setShares(d); });
     // Load existing public link
     ap(`/share/${file.hash}/public`).then(r=>r.json()).then(d=>{
-      if (d.exists) setPublicLink(d);
-    });
+      if (d.exists && d.token) {
+        setPublicLink({
+          exists: true,
+          token: d.token,
+          public_url: d.public_url || `${window.location.origin}/p/${d.token}`,
+        });
+      }
+    }).catch(()=>{});
   }, [file.hash]); // eslint-disable-line
 
   const share = async () => {
@@ -615,12 +621,22 @@ function ShareModal({ file, token, onClose }) {
   };
 
   const createPublicLink = async () => {
-    const res  = await ap(`/share/${file.hash}/public`, {method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({expires_days: expiry ? parseInt(expiry) : null})});
-    const data = await res.json();
-    if (res.ok || res.status===200) {
-      setPublicLink({exists:true, token:data.token, public_url:data.public_url||`${window.location.origin}/p/${data.token}`});
+    try {
+      const res  = await ap(`/share/${file.hash}/public`, {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({expires_days: expiry ? parseInt(expiry) : null})});
+      const data = await res.json();
+      if (!res.ok && res.status !== 200) {
+        setError(data.error || "Failed to create public link");
+        return;
+      }
+      // Works for both "created" (201) and "exists" (200) responses
+      const token = data.token;
+      const url   = `${window.location.origin}/p/${token}`;
+      setPublicLink({exists:true, token, public_url:url});
+      setSuccess("Public link created — copy and share it");
+    } catch(e) {
+      setError("Failed to create public link: " + e.message);
     }
   };
 

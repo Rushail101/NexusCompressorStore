@@ -9,7 +9,7 @@ const WS_URL             = import.meta.env.VITE_WS_URL  || "ws://localhost:5000/
 const RESUMABLE_THRESHOLD = 10 * 1024 * 1024;
 const CHUNK_SIZE          = 256 * 1024;
 
-// ── Shared UI Format Utilities ────────────────────────────────────
+// ── Shared UI Format Utilities & Restored Mappings ────────────────
 
 const fmt = (b) => {
   if (!b || b===0) return "0 B";
@@ -26,6 +26,9 @@ const relTime = (ts) => {
   return Math.floor(d/86400)+"d ago";
 };
 const catIcon  = (c) => ({image:"🖼️",video:"🎬",audio:"🎵",document:"📄",archive:"📦",code:"💻",other:"📎"})[c]||"📎";
+
+// RESTORED: The exact dynamic visual styling map color tracker to clear the browser ReferenceError crash
+const catColor = (c) => ({image:"#F59E0B",video:"#EF4444",audio:"#8B5CF6",document:"#3B82F6",archive:"#F97316",code:"#10B981",other:"#6B7280"})[c]||"#6B7280";
 
 const apiFetch = (token) => (path, opts={}) =>
   fetch(`${API}${path}`, { ...opts, headers:{ Authorization:`Bearer ${token}`, ...opts.headers }});
@@ -145,7 +148,7 @@ function AuthPage({ onAuth }) {
   );
 }
 
-// ── Sprint 2 Share Panel with Fixed Hex Color Tokens ─────────────────────────
+// ── Share Panel with Fixed Hex Color Tokens ─────────────────────────
 
 function ShareModal({ file, token, onClose }) {
   const [email, setEmail] = useState(""); const [shares, setShares] = useState([]); const [publicLink, setPublicLink] = useState(null); const [copied, setCopied] = useState(false); const [success, setSuccess] = useState(""); const ap = useMemo(() => apiFetch(token), [token]);
@@ -178,7 +181,6 @@ function ShareModal({ file, token, onClose }) {
         ) : <button onClick={async()=>{ const r=await ap(`/share/${file.hash}/public`,{method:"POST"}); const d=await r.json(); setPublicLink(d.public_url); }} style={{width:"100%",padding:10,background:"#161616",border:"1px solid #222",color:"#10B981",borderRadius:6,cursor:"pointer"}}>Build Anonymous Gateway Access Link</button>}
         {shares.length > 0 && (
           <div style={{marginTop:12,maxHeight:100,overflowY:"auto"}}>
-            {/* FIXED: Quotes added to hex color tokens below to resolve Rolldown build errors */}
             {shares.map(s=><div key={s.shared_with} style={{fontSize:11,color:"#aaa",padding:"3px 0"}}>• {s.shared_with} <span style={{color:"#333"}}>({relTime(s.created_at)})</span></div>)}
           </div>
         )}
@@ -217,8 +219,9 @@ function MarketplaceSettings({ token, stats, refreshStats }) {
   return (
     <div style={{background:"rgba(255,255,255,0.01)",border:"1px solid #141414",borderRadius:10,padding:10,marginTop:10,fontFamily:"monospace"}}>
       <div style={{display:"flex",gap:4}}>
-        <button onClick={()=>setPlan("Option_A_Eco")} style={{flex:1,padding:4,fontSize:10,background:plan==="Option_A_Eco"?"rgba(16,185,129,0.1)":"transparent",color:"#10B981",border:"none",cursor:"pointer"}}>🌱 Eco</button>
-        <button onClick={()=>setPlan("Option_B_Pro")} style={{flex:1,padding:4,fontSize:10,background:plan==="Option_B_Pro"?"rgba(139,92,246,0.1)":"transparent",color:"#A78BFA",border:"none",cursor:"pointer"}}>⚒️ Miner</button>
+        {/* FIXED: Removed internal text macro typo evaluation boundaries */}
+        <button onClick={()=>setPlan("Option_A_Eco")} style={{flex:1,padding:4,fontSize:10,background:plan === "Option_A_Eco" ? "rgba(16,185,129,0.1)" : "transparent",color:"#10B981",border:"none",cursor:"pointer"}}>🌱 Eco</button>
+        <button onClick={()=>setPlan("Option_B_Pro")} style={{flex:1,padding:4,fontSize:10,background:plan === "Option_B_Pro" ? "rgba(139,92,246,0.1)" : "transparent",color:"#A78BFA",border:"none",cursor:"pointer"}}>⚒️ Miner</button>
       </div>
       {plan==="Option_A_Eco" ? (
         <p style={{fontSize:10,color:"#444",marginTop:6}}>Compress delta bonus factor active.</p>
@@ -238,7 +241,6 @@ function Sidebar({ stats, activeView, setActiveView, user, onSignOut, trashCount
       {[{id:"active",icon:"🗂️",label:"My Files"},{id:"trash",icon:"🗑️",label:"Trash Collection",badge:trashCount}].map(item=>(
         <button key={item.id} onClick={()=>setActiveView(item.id)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:activeView===item.id?"rgba(255,255,255,0.04)":"transparent",color:"#fff",border:"none",cursor:"pointer",borderRadius:8,fontFamily:"monospace",fontSize:13}}><span style={{display:"flex",alignItems:"center",gap:10}}><span>{item.icon}</span>{item.label}</span></button>
       ))}
-      {/* FIXED: Quotes added around text color key targets below */}
       <div style={{marginTop:"auto",padding:10,background:"#111",borderRadius:10}}><p style={{margin:0,fontSize:11,color:"#666"}}>{fmt(stats?.total_stored||0)} shared</p></div>
       <MarketplaceSettings token={token} stats={stats} refreshStats={refreshStats} />
       <button onClick={onSignOut} style={{background:"none",border:"1px solid #222",color:"#666",borderRadius:6,padding:6,cursor:"pointer",marginTop:6,fontFamily:"monospace",fontSize:11}}>Channel Terminate</button>
@@ -249,7 +251,7 @@ function Sidebar({ stats, activeView, setActiveView, user, onSignOut, trashCount
 function TopBar({ onUpload, onNewFolder, uploading, searchQuery, setSearchQuery }) {
   return (
     <header style={{height:58,display:"flex",alignItems:"center",gap:12,padding:"0 1.25rem",borderBottom:"1px solid #141414",background:"#0f0f0f",width:"100%"}}>
-      <span style={{fontSize:16,fontWeight:700,fontFamily:"monospace",color:"#fff"}}>⬡ VIRUS_LABS // NEXUS</span>
+      <span style={{fontSize:16,fontWeight:700,fontFamily:"monospace",color:"#fff"}}>⬡ NEXUS</span>
       <input value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="🔍 Query structural layout indices network-wide..." style={{flex:1,maxWidth:400,marginLeft:20,padding:"8px 12px",background:"#141414",border:"1px solid #222",color:"#fff",borderRadius:8,fontSize:12,fontFamily:"monospace",outline:"none"}}/>
       <div style={{marginLeft:"auto",display:"flex",gap:8}}>
         <button onClick={onNewFolder} style={{background:"#141414",color:"#fff",border:"1px solid #333",padding:"6px 12px",borderRadius:6,cursor:"pointer",fontSize:11}}>+ Folder</button>
@@ -281,8 +283,8 @@ function FileRow({ file, view, onStar, onTrash, onP2PDownload, onShare, isSelect
       <div style={{display:"flex",gap:12}} onClick={e=>e.stopPropagation()}>
         <button onClick={()=>onP2PDownload(file)} style={{background:"none",border:"none",color:"#3B82F6",cursor:"pointer"}}>⬇</button>
         <button onClick={()=>onShare(file)} style={{background:"none",border:"none",color:"#10B981",cursor:"pointer"}}>🔗</button>
-        <button onClick={()=>onStar(file.hash)} style={{background:"none",border:"none",color:file.starred?"#FCD34D":"#222",cursor:"pointer"}}>{file.starred?"★":"☆"}</button>
-        <button onClick={()=>onTrash(file.hash)} style={{background:"none",border:"none",color:"#444",cursor:"pointer"}}>🗑</button>
+        <button onClick={async () => await onStar(file.hash)} title="Star Toggle" style={{background:"none",border:"none",color:file.starred?"#FCD34D":"#222",cursor:"pointer"}}>{file.starred?"★":"☆"}</button>
+        <button onClick={async () => await onTrash(file.hash)} title="Move to Trash" style={{background:"none",border:"none",color:"#444",cursor:"pointer"}}>🗑</button>
       </div>
     </div>
   );
@@ -350,6 +352,16 @@ export default function App() {
     refresh();
   };
 
+  const handleToggleStar = async (hash) => {
+    if (!ap) return;
+    await ap(`/star/${hash}`, { method: "PATCH" }); refresh();
+  };
+
+  const handleMoveToTrash = async (hash) => {
+    if (!ap) return;
+    await ap(`/trash/${hash}`, { method: "PATCH" }); refresh();
+  };
+
   if (!authReady) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"#0a0a0a",color:"#EF4444",fontFamily:"monospace"}}>initial_boot_sequence_active...</div>;
   if (!session) return <AuthPage onAuth={setSession}/>;
 
@@ -377,7 +389,7 @@ export default function App() {
               <span/><span>Identity Cluster</span><span>Raw Size</span><span>Mesh Footprint</span><span>Ratio</span><span>Committed</span><span/>
             </div>
             {folders.map(f=><FolderRow key={f.id} folder={f} onOpen={setCurrentFolderId} onDelete={()=>ap(`/folders/${f.id}`,{method:"DELETE"}).then(()=>refresh())} onFileDropped={handleFileMove}/>)}
-            {files.filter(f=>f.filename.toLowerCase().includes(searchQuery.toLowerCase())).map(f=><FileRow key={f.hash} file={f} view={activeView} onStar={async(h)=>{ await ap(`/star/${h}`,{method:"PATCH"}); refresh(); }} onTrash={async(h)=>{ await ap(`/trash/${h}`,{method:"PATCH"}); refresh(); }} onP2PDownload={setP2pTarget} onShare={setShareTarget} isSelected={selectedFileHashes.includes(f.hash)} onToggleSelect={(h)=>setSelectedFileHashes(p=>p.includes(h)?p.filter(x=>x!==h):[...p,h])}/>)}
+            {files.filter(f=>f.filename.toLowerCase().includes(searchQuery.toLowerCase())).map(f=><FileRow key={f.hash} file={f} view={activeView} onStar={handleToggleStar} onTrash={handleMoveToTrash} onP2PDownload={setP2pTarget} onShare={setShareTarget} isSelected={selectedFileHashes.includes(f.hash)} onToggleSelect={(h)=>setSelectedFileHashes(p=>p.includes(h)?p.filter(x=>x!==h):[...p,h])}/>)}
           </div>
           <ActivityLogPanel token={token} />
         </main>

@@ -293,38 +293,60 @@ function TopBar({ onUpload, onNewFolder, uploading, searchQuery, setSearchQuery 
 // ── Draggable Grid Rows ───────────────────────────────────────────
 
 function FileRow({ file, view, onStar, onTrash, onP2PDownload, onShare, isSelected, onToggleSelect }) {
-  const [hover,setHover] = useState(false);
-  const p = file.original_size>0?Math.round(((file.original_size-file.stored_size)/file.original_size)*100):0;
+  const [hover, setHover] = useState(false);
+  const p = file.original_size > 0 ? Math.round(((file.original_size - file.stored_size) / file.original_size) * 100) : 0;
+  
   return (
-    <div onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+    <div 
+      onMouseEnter={() => setHover(true)} 
+      onMouseLeave={() => setHover(false)}
       draggable={view === "active"}
-      onDragStart={(e)=>{ e.dataTransfer.setData("text/plain", file.hash); }}
-      style={{display:"grid",gridTemplateColumns:"40px 2fr 1fr 1fr 70px 1fr auto",alignItems:"center",gap:12,padding:"10px 16px",background:isSelected?"rgba(59,130,246,0.05)":hover?"rgba(255,255,255,0.04)":"transparent",borderBottom:"0.5px solid rgba(255,255,255,0.05)",fontSize:13,transition:"background 0.1s",cursor:view Freemium-Tier==="active"?"grab":"default"}}>
-      <input type="checkbox" checked={isSelected} onChange={()=>onToggleSelect(file.hash)} onClick={e=>e.stopPropagation()} style={{accentColor:"#3B82F6"}}/>
-      <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0}}>
-        <div style={{width:32,height:32,borderRadius:8,background:`${catColor(file.category)}22`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>{catIcon(file.category)}</div>
-        <div style={{minWidth:0}}>
-          <p style={{margin:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:"#fff",fontWeight:500}}>{file.filename}</p>
-          <div style={{display:"flex",gap:6,marginTop:2}}>
-            {file.version_number > 1 && <span style={{fontSize:9,background:"rgba(139,92,246,0.15)",color:"#A78BFA",padding:"1px 4px",borderRadius:4}}>v{file.version_number}</span>}
-            {file.starred && <span style={{fontSize:10,color:"#FCD34D"}}>★</span>}
-          </div>
-        </div>
+      onDragStart={(e) => { e.dataTransfer.setData("text/plain", file.hash); }}
+      style={{
+        display: "grid",
+        gridTemplateColumns: "40px 2fr 1fr 1fr 70px 1fr auto",
+        alignItems: "center",
+        gap: 12,
+        padding: "10px 16px",
+        background: isSelected ? "rgba(59, 130, 246, 0.05)" : hover ? "rgba(255, 255, 255, 0.02)" : "transparent",
+        borderBottom: "1px solid rgba(255, 255, 255, 0.05)",
+        fontSize: 13,
+        fontFamily: "monospace",
+        cursor: view === "active" ? "grab" : "default",
+        transition: "background 0.1s"
+      }}
+    >
+      <input 
+        type="checkbox" 
+        checked={isSelected} 
+        onChange={() => onToggleSelect(file.hash)} 
+        onClick={(e) => e.stopPropagation()} 
+        style={{ accentColor: "#3B82F6" }}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        <span style={{ color: catColor(file.category) }}>{catIcon(file.category)}</span>
+        <span style={{ color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {file.filename}
+        </span>
+        {file.version_number > 1 && (
+          <span style={{ fontSize: 9, background: "rgba(139,92,246,0.15)", color: "#A78BFA", padding: "1px 4px", borderRadius: 4 }}>
+            v{file.version_number}
+          </span>
+        )}
       </div>
-      <span style={{color:"rgba(255,255,255,0.45)"}}>{fmt(file.original_size)}</span>
-      <span style={{color:"rgba(255,255,255,0.45)"}}>{fmt(file.stored_size)}</span>
-      <span style={{color:"#10B981",fontWeight:500}}>{p}%</span>
-      <span style={{color:"rgba(255,255,255,0.3)"}}>{relTime(file.upload_time)}</span>
-      <div style={{display:"flex",gap:4}} onClick={e=>e.stopPropagation()}>
-        <button onClick={()=>onP2PDownload(file)} style={{background:"rgba(59,130,246,0.1)",border:"0.5px solid rgba(59,130,246,0.3)",borderRadius:7,padding:"5px 8px",cursor:"pointer",color:"#60A5FA"}}>⬇</button>
-        <button onClick={()=>onShare(file)} style={{background:"rgba(16,185,129,0.1)",border:"0.5px solid rgba(16,185,129,0.3)",borderRadius:7,padding:"5px 8px",cursor:"pointer",color:"#34D399"}}>🔗</button>
-        <button onClick={()=>onStar(file.hash)} style={{background:file.starred?"rgba(251,191,36,0.15)":"none",border:`0.5px solid ${file.starred?"rgba(251,191,36,0.4)":"rgba(255,255,255,0.1)"}`,borderRadius:7,padding:"5px 7px",cursor:"pointer",color:file.starred?"#FCD34D":"rgba(255,255,255,0.35)"}}>{file.starred?"★":"☆"}</button>
-        <button onClick={()=>onTrash(file.hash)} style={{background:"none",border:"0.5px solid rgba(255,255,255,0.1)",borderRadius:7,padding:"5px 7px",cursor:"pointer",color:"rgba(255,255,255,0.3)"}}>🗑</button>
+      <span style={{ color: "rgba(255, 255, 255, 0.45)" }}>{fmt(file.original_size)}</span>
+      <span style={{ color: "rgba(255, 255, 255, 0.45)" }}>{fmt(file.stored_size)}</span>
+      <span style={{ color: "#10B981", fontWeight: 500 }}>{p}%</span>
+      <span style={{ color: "rgba(255, 255, 255, 0.2)" }}>{relTime(file.upload_time)}</span>
+      <div style={{ display: "flex", gap: 12 }} onClick={(e) => e.stopPropagation()}>
+        <button onClick={() => onP2PDownload(file)} style={{ background: "none", border: "none", color: "#3B82F6", cursor: "pointer" }}>⬇</button>
+        <button onClick={() => onShare(file)} style={{ background: "none", border: "none", color: "#10B981", cursor: "pointer" }}>🔗</button>
+        <button onClick={async () => await onStar(file.hash)} title="Star Toggle" style={{ background: "none", border: "none", color: file.starred ? "#FCD34D" : "#222", cursor: "pointer" }}>{file.starred ? "★" : "☆"}</button>
+        <button onClick={async () => await onTrash(file.hash)} title="Move to Trash" style={{ background: "none", border: "none", color: "#444", cursor: "pointer" }}>🗑</button>
       </div>
     </div>
   );
 }
-
 function FolderRow({ folder, onOpen, onDelete, onFileDropped }) {
   const [hover,setHover] = useState(false); const [dragOver,setDragOver] = useState(false);
   return (

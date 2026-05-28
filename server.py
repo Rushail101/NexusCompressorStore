@@ -1,14 +1,10 @@
 """
-Nexus – Production server (Phase 8 + Features 1, 2, 3)
-=======================================================
+Nexus – Production server (Phase 8 + Features 1, 2, 3 + Sprint 1 Core UX)
+======================================================================
 Feature 1: Client-side pre-compression
 Feature 2: Resumable uploads
 Feature 3: Public share links
-
-The critical fix vs previous versions:
-  serve_react() is registered AFTER all API routes, and explicitly
-  excludes paths that start with known API prefixes so it never
-  accidentally intercepts an API call and returns HTML.
+Sprint 1: Global Search parameters, Batch Actions, & Safe Folder drops.
 """
 
 from flask import Flask, request, jsonify, send_file, send_from_directory, g
@@ -166,11 +162,16 @@ def db_get_file_by_name(uid, filename, folder_id=None):
     res = q.limit(1).execute()
     return res.data[0] if res.data else None
 
-def db_list_files(uid, view="active", folder_id=None):
+def db_list_files(uid, view="active", folder_id=None, is_global_search=False):
     q = sb.table("files").select("*").eq("user_id", uid)
     if view == "active":
         q = q.is_("deleted_at", "null")
-        q = q.eq("folder_id", folder_id) if folder_id else q.is_("folder_id", "null")
+        # Sprint 1 Fix: Bypass folder ID constraint if executing a global search routine
+        if not is_global_search:
+            if folder_id:
+                q = q.eq("folder_id", folder_id)
+            else:
+                q = q.is_("folder_id", "null")
     elif view == "starred":
         q = q.eq("starred", True).is_("deleted_at", "null")
     elif view == "trash":
@@ -760,7 +761,10 @@ def public_link_info(token):
                 return jsonify({"error": "This link has expired"}), 410
         except Exception: pass
 
-    fi  = share.get("files", {})
+    # Fixed list object parsing pattern
+    files_data = share.get("files", [])
+    fi = files_data[0] if isinstance(files_data, list) and len(files_data) > 0 else (files_data if isinstance(files_data, dict) else {})
+    
     pct = 0
     if fi.get("original_size") and fi.get("stored_size"):
         pct = round((1 - fi["stored_size"] / fi["original_size"]) * 100, 1)
@@ -790,17 +794,27 @@ def public_download(token):
                 return jsonify({"error": "This link has expired"}), 410
         except Exception: pass
 
-    fi        = share.get("files", {})
-    uid       = share["owner_id"]
+    # Fixed list parsing mapping bug vs original nested arrays
+    files_data = share.get("files", [])
+    if isinstance(files_data, list) and len(files_data) > 0:
+        fi = files_data[0]
+    elif isinstance(files_data, dict):
+        fi = files_data
+    else:
+        fi = {}
+
+    uid       = share.get("owner_id")
     file_hash = fi.get("hash")
-    if not file_hash: return jsonify({"error": "File not found"}), 404
+    filename  = fi.get("filename", "download")
+
+    if not file_hash: return jsonify({"error": "File parsing mapping bug"}), 404
 
     try:
         blob     = storage_download(BLOB_BUCKET, blob_path(uid, file_hash))
         original = zstd.ZstdDecompressor().decompress(decrypt(blob, file_hash))
-        return send_file(io.BytesIO(original), download_name=fi.get("filename"), as_attachment=True)
+        return send_file(io.BytesIO(original), download_name=filename, as_attachment=True)
     except Exception as e:
-        return jsonify({"error": f"Download failed: {e}"}), 500
+        return jsonify({"error": f"Download failed: {str(e)}"}), 500
 
 # ── Private sharing ───────────────────────────────────────────────────────────
 
@@ -905,13 +919,19 @@ def delete_folder(folder_id):
     sb.table("folders").delete().eq("id", folder_id).eq("user_id", g.uid).execute()
     return jsonify({"status": "deleted"})
 
+# ── Sprint 1 UX: File Drop Move Target Handler ───────────────────────────────
 @app.route("/files/<file_hash>/move", methods=["PATCH"])
 @require_auth
 def move_file(file_hash):
     body = request.get_json(silent=True) or {}
-    sb.table("files").update({"folder_id": body.get("folder_id")})\
+    target_folder = body.get("folder_id")
+    # Clean up empty strings or false references to evaluate as raw root null indices
+    if target_folder == "" or target_folder == "null":
+        target_folder = None
+        
+    sb.table("files").update({"folder_id": target_folder})\
         .eq("hash", file_hash).eq("user_id", g.uid).execute()
-    return jsonify({"status": "moved"})
+    return jsonify({"status": "moved", "folder_id": target_folder})
 
 @app.route("/folders/<folder_id>/breadcrumb", methods=["GET"])
 @require_auth
@@ -931,8 +951,13 @@ def folder_breadcrumb(folder_id):
 @app.route("/files", methods=["GET"])
 @require_auth
 def list_files():
-    view = request.args.get("view", "active"); folder_id = request.args.get("folder_id")
-    files = db_list_files(g.uid, view, folder_id if view == "active" else None)
+    view = request.args.get("view", "active")
+    folder_id = request.args.get("folder_id")
+    
+    # Sprint 1 UX: Evaluate global parameter to pass folder isolation bypass rules
+    is_search = request.args.get("search", "").lower() == "true"
+    
+    files = db_list_files(g.uid, view, folder_id if view == "active" else None, is_global_search=is_search)
     cutoff = time.time() - TRASH_DAYS * 86400; to_purge = []
     for f in files:
         if view == "trash" and f.get("deleted_at"):
@@ -1021,6 +1046,9 @@ def stats():
         "live_peers": len(peers),
         "ml_models_trained": sum(1 for v in _ml_version.values() if v > 0),
         "quota_bytes": quota, "quota_used_pct": round(used/quota*100, 2) if quota else 0,
+        "dynamic_quota_bonus": s.get("dynamic_quota_bonus", 0),
+        "balance_usd": float(s.get("balance_usd", 0.0)),
+        "current_plan": s.get("current_plan", "Option_A_Eco")
     })
 
 @app.route("/ml_status", methods=["GET"])
@@ -1068,9 +1096,6 @@ def list_peers():
     return jsonify({"count": len(peers), "peers": peer_summary()})
 
 # ── React build serving — MUST be last ───────────────────────────────────────
-# This catch-all serves index.html for any path not matched above.
-# It explicitly returns 404 JSON for paths that look like API calls
-# so you never get HTML back when expecting JSON.
 
 API_PREFIXES = (
     "/upload", "/files", "/folders", "/share", "/shared",
@@ -1082,8 +1107,6 @@ API_PREFIXES = (
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_react(path):
-    # If the path looks like an API call, return 404 JSON instead of HTML.
-    # This prevents "SyntaxError: Unexpected token '<'" in the browser console.
     full_path = "/" + path
     if any(full_path.startswith(prefix) for prefix in API_PREFIXES):
         return jsonify({"error": f"Route {full_path} not found"}), 404
